@@ -1,0 +1,41 @@
+D3QN-PER Training Log
+============================================================
+
+CONFIGURATION:
+  Agent ID: 001_no_wall
+  Device: cpu
+  Mixed Precision: False
+  Hidden Dim: 128
+  Learning Rate: 0.0005
+  Batch Size: 256
+  Gamma: 0.99
+  PER Alpha: 0.6
+  PER Beta Start: 0.4
+
+TRAINING STATISTICS:
+  Total Episodes: 3000
+  Total Steps: 2946640
+  Training Time: 7384.9s (123.1 min)
+  Steps/Second: 399.0
+  Episodes/Second: 0.41
+
+FINAL PERFORMANCE (last 100 episodes):
+  Mean Return: -6124.54 ± 22024.20
+  Mean Length: 1000.0
+  Success Rate: 0.0%
+  Best Success Rate: 19.0%
+
+ACTION DISTRIBUTION:
+  L45:  863454 ( 29.3%)
+  L22:  594536 ( 20.2%)
+  FW:  234935 (  8.0%)
+  R22:  808163 ( 27.4%)
+  R45:  445552 ( 15.1%)
+
+REWARD STATISTICS:
+  Total Rewards: 2946640
+  Positive: 6515 (0.2%)
+  Negative: 2936688 (99.7%)
+  Zero: 3437 (0.1%)
+  Mean Reward: -31.924
+

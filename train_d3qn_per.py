@@ -1609,21 +1609,21 @@ def main():
                    help="Pin memory for faster GPU transfer")
     
     # D3QN-PER hyperparameters
-    ap.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    ap.add_argument("--gamma", type=float, default=0.999, help="Discount factor")
     ap.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     ap.add_argument("--batch", type=int, default=256, help="Batch size")
     ap.add_argument("--replay_capacity", type=int, default=100000, help="Replay buffer capacity")
-    ap.add_argument("--hidden_dim", type=int, default=128, help="Hidden layer dimension")
+    ap.add_argument("--hidden_dim", type=int, default=64, help="Hidden layer dimension")
     ap.add_argument("--warmup", type=int, default=2000, help="Warmup steps before training")
-    ap.add_argument("--target_sync", type=int, default=2000, help="Target network sync frequency")
+    ap.add_argument("--target_sync", type=int, default=1700, help="Target network sync frequency")
     
     # Exploration
     ap.add_argument("--eps_start", type=float, default=1.0, help="Initial epsilon")
     ap.add_argument("--eps_end", type=float, default=0.02, help="Final epsilon")
-    ap.add_argument("--eps_decay_steps", type=int, default=250000, help="Epsilon decay steps")
+    ap.add_argument("--eps_decay_steps", type=int, default=750000, help="Epsilon decay steps")
     
     # PER hyperparameters
-    ap.add_argument("--per_alpha", type=float, default=0.6, help="PER alpha (prioritization)")
+    ap.add_argument("--per_alpha", type=float, default=0.7, help="PER alpha (prioritization)")
     ap.add_argument("--per_beta_start", type=float, default=0.4, help="PER beta start")
     
     # Multi-seed training for better generalization (CRITICAL for competition)
