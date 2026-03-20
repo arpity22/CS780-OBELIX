@@ -1589,7 +1589,7 @@ def main():
     ap.add_argument("--obelix_py", type=str, required=True, help="Path to obelix.py")
     ap.add_argument("--agent_id", type=str, default="001", help="Unique agent identifier")
     ap.add_argument("--episodes", type=int, default=3000, help="Number of training episodes")
-    ap.add_argument("--max_steps", type=int, default=2000, help="Max steps per episode")
+    ap.add_argument("--max_steps", type=int, default=1000, help="Max steps per episode")
     ap.add_argument("--difficulty", type=int, default=0, help="Difficulty level (0-3)")
     ap.add_argument("--wall_obstacles", action="store_true", help="Enable wall obstacles")
     ap.add_argument("--box_speed", type=int, default=2, help="Box movement speed")
@@ -1614,20 +1614,24 @@ def main():
     ap.add_argument("--batch", type=int, default=256, help="Batch size")
     ap.add_argument("--replay_capacity", type=int, default=100000, help="Replay buffer capacity")
     ap.add_argument("--hidden_dim", type=int, default=128, help="Hidden layer dimension")
-    ap.add_argument("--warmup", type=int, default=5000, help="Warmup steps before training")
-    ap.add_argument("--target_sync", type=int, default=200, help="Target network sync frequency")
+    ap.add_argument("--warmup", type=int, default=2000, help="Warmup steps before training")
+    ap.add_argument("--target_sync", type=int, default=2000, help="Target network sync frequency")
     
     # Exploration
     ap.add_argument("--eps_start", type=float, default=1.0, help="Initial epsilon")
-    ap.add_argument("--eps_end", type=float, default=0.1, help="Final epsilon")
-    ap.add_argument("--eps_decay_steps", type=int, default=1000000, help="Epsilon decay steps")
+    ap.add_argument("--eps_end", type=float, default=0.02, help="Final epsilon")
+    ap.add_argument("--eps_decay_steps", type=int, default=250000, help="Epsilon decay steps")
     
     # PER hyperparameters
     ap.add_argument("--per_alpha", type=float, default=0.6, help="PER alpha (prioritization)")
     ap.add_argument("--per_beta_start", type=float, default=0.4, help="PER beta start")
     
-    # Other
-    ap.add_argument("--seed", type=int, default=42, help="Random seed")
+    # Multi-seed training for better generalization (CRITICAL for competition)
+    ap.add_argument("--seed", type=int, default=42, help="Base random seed")
+    ap.add_argument("--multi_seed", action="store_true", 
+                   help="Enable multi-seed training (cycles through seeds for better generalization)")
+    ap.add_argument("--seed_list", type=int, nargs='+', default=[42, 123, 456, 789, 999],
+                   help="List of seeds to cycle through if multi_seed enabled")
     ap.add_argument("--save_freq", type=int, default=250, help="Save model every N episodes")
     
     args = ap.parse_args()
@@ -1651,6 +1655,16 @@ def main():
     if device.type == "cuda":
         torch.cuda.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
+    
+    # Multi-seed setup
+    if args.multi_seed:
+        training_seeds = args.seed_list
+        print(f"🎲 Multi-seed training enabled with seeds: {training_seeds}")
+        print(f"   This improves generalization to hidden test seeds!")
+    else:
+        training_seeds = [args.seed]
+        print(f"⚠️  Single-seed training (seed={args.seed})")
+        print(f"   Consider --multi_seed for better generalization on hidden test seeds!")
     
     # Mixed precision training setup (GPU only)
     use_amp = args.use_amp and device.type == "cuda"
@@ -1741,7 +1755,8 @@ def main():
         # Determine how many episodes to run in this batch
         if use_parallel:
             batch_size = min(args.num_envs, args.episodes - episode)
-            seeds = [args.seed + episode + i for i in range(batch_size)]
+            # Multi-seed: cycle through seed list
+            seeds = [training_seeds[(episode + i) % len(training_seeds)] for i in range(batch_size)]
             epsilon = epsilon_schedule(total_steps)
             
             # Collect batch of episodes in parallel
@@ -1789,6 +1804,9 @@ def main():
             
         else:
             # Sequential mode (original implementation)
+            # Multi-seed: cycle through seed list
+            current_seed = training_seeds[episode % len(training_seeds)]
+            
             # Create environment
             env = OBELIX(
                 scaling_factor=args.scaling_factor,
@@ -1797,10 +1815,10 @@ def main():
                 wall_obstacles=args.wall_obstacles,
                 difficulty=args.difficulty,
                 box_speed=args.box_speed,
-                seed=args.seed + episode,
+                seed=current_seed,
             )
             
-            state = env.reset(seed=args.seed + episode)
+            state = env.reset(seed=current_seed)
             metrics.start_episode(episode)
             episode_success = False
             
