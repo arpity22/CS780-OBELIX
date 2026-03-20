@@ -1,0 +1,13 @@
+D3QN-PER Training Log
+============================================================
+
+Agent ID: 002
+Total Episodes: 300
+Total Steps: 297686
+Training Time: 10902.7s
+
+Final Performance (last 100 episodes):
+  Mean Return: -53906.20 ± 51928.94
+  Mean Length: 995.4
+  Success Rate: 3.0%
+  Best Success Rate: 1.0%
