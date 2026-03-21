@@ -1628,21 +1628,21 @@ def main():
                    help="Pin memory for faster GPU transfer")
     
     # D3QN-PER hyperparameters
-    ap.add_argument("--gamma", type=float, default=0.999, help="Discount factor")
+    ap.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     ap.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
-    ap.add_argument("--batch", type=int, default=128, help="Batch size")
+    ap.add_argument("--batch", type=int, default=256, help="Batch size")
     ap.add_argument("--replay_capacity", type=int, default=100000, help="Replay buffer capacity")
-    ap.add_argument("--hidden_dim", type=int, default=64, help="Hidden layer dimension")
+    ap.add_argument("--hidden_dim", type=int, default=128, help="Hidden layer dimension")
     ap.add_argument("--warmup", type=int, default=2000, help="Warmup steps before training")
-    ap.add_argument("--target_sync", type=int, default=1700, help="Target network sync frequency")
+    ap.add_argument("--target_sync", type=int, default=2000, help="Target network sync frequency")
     
     # Exploration
     ap.add_argument("--eps_start", type=float, default=1.0, help="Initial epsilon")
     ap.add_argument("--eps_end", type=float, default=0.02, help="Final epsilon")
-    ap.add_argument("--eps_decay_steps", type=int, default=750000, help="Epsilon decay steps")
+    ap.add_argument("--eps_decay_steps", type=int, default=250000, help="Epsilon decay steps")
     
     # PER hyperparameters
-    ap.add_argument("--per_alpha", type=float, default=0.7, help="PER alpha (prioritization)")
+    ap.add_argument("--per_alpha", type=float, default=0.6, help="PER alpha (prioritization)")
     ap.add_argument("--per_beta_start", type=float, default=0.4, help="PER beta start")
     
     # Multi-seed training for better generalization (CRITICAL for competition)
@@ -1655,12 +1655,22 @@ def main():
     # Reward shaping for sparse reward problems (CRITICAL for OBELIX)
     ap.add_argument("--reward_shaping", action="store_true",
                    help="Enable reward shaping to help agent learn in sparse reward environment")
-    ap.add_argument("--shape_forward_bonus", type=float, default=0.0005,
+    ap.add_argument("--shape_forward_bonus", type=float, default=0.5,
                    help="Bonus reward for moving forward (encourages exploration)")
-    ap.add_argument("--shape_sensor_bonus", type=float, default=0.0020,
+    ap.add_argument("--shape_sensor_bonus", type=float, default=2.0,
                    help="Bonus reward when any sensor activates (finding box area)")
-    ap.add_argument("--shape_ir_bonus", type=float, default=0.0050,
+    ap.add_argument("--shape_ir_bonus", type=float, default=5.0,
                    help="Bonus reward for IR sensor activation (very close to box)")
+    
+    # Curriculum training and checkpoint loading
+    ap.add_argument("--load_checkpoint", type=str, default=None,
+                   help="Load checkpoint from previous training phase (e.g., 'phase1' to load from submission_phase1/)")
+    ap.add_argument("--checkpoint_episode", type=int, default=None,
+                   help="Specific checkpoint episode to load (e.g., 1500 for checkpoint_ep1500.pth). If None, loads weights.pth")
+    ap.add_argument("--curriculum_phase", type=int, default=1,
+                   help="Current curriculum phase number (1-4). Used for documentation only.")
+    ap.add_argument("--reset_optimizer", action="store_true",
+                   help="Reset optimizer when loading checkpoint (useful for changing learning rate)")
     
     ap.add_argument("--save_freq", type=int, default=250, help="Save model every N episodes")
     
@@ -1707,26 +1717,7 @@ def main():
     submission_dir = Path(f"submission_{args.agent_id}")
     submission_dir.mkdir(exist_ok=True)
     
-    print(f"\n{'='*60}")
-    print(f"D3QN-PER Training for OBELIX")
-    print(f"{'='*60}")
-    print(f"Agent ID: {args.agent_id}")
-    print(f"Submission Dir: {submission_dir}")
-    print(f"Episodes: {args.episodes}")
-    print(f"Difficulty: {args.difficulty}")
-    print(f"Wall Obstacles: {args.wall_obstacles}")
-    print(f"Device: {device}")
-    print(f"Mixed Precision: {use_amp}")
-    if args.reward_shaping:
-        print(f"Reward Shaping: ENABLED ⚡")
-        print(f"  - Forward bonus: +{args.shape_forward_bonus}")
-        print(f"  - Sensor bonus: +{args.shape_sensor_bonus}")
-        print(f"  - IR bonus: +{args.shape_ir_bonus}")
-    else:
-        print(f"Reward Shaping: DISABLED (raw environment rewards)")
-    print(f"{'='*60}\n")
-    
-    # Import environment
+    # Import environment  
     OBELIX = import_obelix(args.obelix_py)
     
     # Initialize networks and move to device
@@ -1740,6 +1731,156 @@ def main():
     
     # Learning rate scheduler for better convergence
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes, eta_min=args.lr/10)
+    
+    # Load checkpoint if specified (for curriculum training)
+    start_episode = 0
+    if args.load_checkpoint:
+        checkpoint_dir = Path(f"submission_{args.load_checkpoint}")
+        
+        if args.checkpoint_episode:
+            checkpoint_path = checkpoint_dir / f"checkpoint_ep{args.checkpoint_episode}.pth"
+        else:
+            checkpoint_path = checkpoint_dir / "weights.pth"
+        
+        if checkpoint_path.exists():
+            print(f"\n{'='*60}")
+            print(f"📂 LOADING CHECKPOINT FROM PREVIOUS PHASE")
+            print(f"{'='*60}")
+            print(f"Checkpoint: {checkpoint_path}")
+            
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            
+            # Load network weights
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                # Full checkpoint with metadata
+                q_network.load_state_dict(checkpoint['state_dict'])
+                target_network.load_state_dict(checkpoint['state_dict'])
+                
+                # Load optimizer and scheduler if not resetting
+                if not args.reset_optimizer and 'optimizer' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    print(f"✓ Loaded optimizer state")
+                else:
+                    print(f"✓ Using fresh optimizer (--reset_optimizer or no saved optimizer)")
+                
+                if not args.reset_optimizer and 'scheduler' in checkpoint:
+                    scheduler.load_state_dict(checkpoint['scheduler'])
+                    print(f"✓ Loaded scheduler state")
+                
+                # Track starting episode for logging
+                if 'episode' in checkpoint:
+                    start_episode = checkpoint['episode']
+                    print(f"✓ Previous training ended at episode {start_episode}")
+                
+                # Show previous stats if available
+                if 'stats' in checkpoint:
+                    prev_stats = checkpoint['stats']
+                    print(f"✓ Previous performance:")
+                    print(f"   - Success rate: {prev_stats.get('success_rate', 0)*100:.1f}%")
+                    print(f"   - Mean return: {prev_stats.get('mean_return', 0):.1f}")
+            else:
+                # weights.pth only (just state dict)
+                q_network.load_state_dict(checkpoint)
+                target_network.load_state_dict(checkpoint)
+                print(f"✓ Loaded network weights only")
+            
+            print(f"{'='*60}\n")
+        else:
+            print(f"\n⚠️  WARNING: Checkpoint not found: {checkpoint_path}")
+            print(f"   Starting training from scratch instead.\n")
+    
+    # Print training configuration banner
+    print(f"\n{'='*60}")
+    print(f"D3QN-PER Training for OBELIX")
+    if args.load_checkpoint:
+        print(f"CURRICULUM TRAINING - Phase {args.curriculum_phase}")
+    print(f"{'='*60}")
+    print(f"Agent ID: {args.agent_id}")
+    print(f"Submission Dir: {submission_dir}")
+    print(f"Episodes: {args.episodes}")
+    if args.load_checkpoint and start_episode > 0:
+        print(f"Continuing from: submission_{args.load_checkpoint} (completed {start_episode} episodes)")
+    print(f"Difficulty: {args.difficulty}")
+    print(f"Wall Obstacles: {args.wall_obstacles}")
+    print(f"Device: {device}")
+    print(f"Mixed Precision: {use_amp}")
+    if args.reward_shaping:
+        print(f"Reward Shaping: ENABLED ⚡")
+        print(f"  - Forward bonus: +{args.shape_forward_bonus}")
+        print(f"  - Sensor bonus: +{args.shape_sensor_bonus}")
+        print(f"  - IR bonus: +{args.shape_ir_bonus}")
+    else:
+        print(f"Reward Shaping: DISABLED (raw environment rewards)")
+    print(f"{'='*60}\n")
+    
+    # Initialize networks and move to device
+    q_network = DuelingDQN(in_dim=18, n_actions=5, hidden_dim=args.hidden_dim).to(device)
+    target_network = DuelingDQN(in_dim=18, n_actions=5, hidden_dim=args.hidden_dim).to(device)
+    target_network.load_state_dict(q_network.state_dict())
+    target_network.eval()
+    
+    # Optimizer with gradient clipping built-in
+    optimizer = optim.Adam(q_network.parameters(), lr=args.lr, eps=1e-5)
+    
+    # Learning rate scheduler for better convergence
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes, eta_min=args.lr/10)
+    
+    # Load checkpoint if specified (for curriculum training)
+    start_episode = 0
+    if args.load_checkpoint:
+        checkpoint_dir = Path(f"submission_{args.load_checkpoint}")
+        
+        if args.checkpoint_episode:
+            checkpoint_path = checkpoint_dir / f"checkpoint_ep{args.checkpoint_episode}.pth"
+        else:
+            checkpoint_path = checkpoint_dir / "weights.pth"
+        
+        if checkpoint_path.exists():
+            print(f"\n{'='*60}")
+            print(f"📂 LOADING CHECKPOINT FROM PREVIOUS PHASE")
+            print(f"{'='*60}")
+            print(f"Checkpoint: {checkpoint_path}")
+            
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            
+            # Load network weights
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                # Full checkpoint with metadata
+                q_network.load_state_dict(checkpoint['state_dict'])
+                target_network.load_state_dict(checkpoint['state_dict'])
+                
+                # Load optimizer and scheduler if not resetting
+                if not args.reset_optimizer and 'optimizer' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    print(f"✓ Loaded optimizer state")
+                else:
+                    print(f"✓ Using fresh optimizer (--reset_optimizer or no saved optimizer)")
+                
+                if not args.reset_optimizer and 'scheduler' in checkpoint:
+                    scheduler.load_state_dict(checkpoint['scheduler'])
+                    print(f"✓ Loaded scheduler state")
+                
+                # Track starting episode for logging
+                if 'episode' in checkpoint:
+                    start_episode = checkpoint['episode']
+                    print(f"✓ Previous training ended at episode {start_episode}")
+                
+                # Show previous stats if available
+                if 'stats' in checkpoint:
+                    prev_stats = checkpoint['stats']
+                    print(f"✓ Previous performance:")
+                    print(f"   - Success rate: {prev_stats.get('success_rate', 0)*100:.1f}%")
+                    print(f"   - Mean return: {prev_stats.get('mean_return', 0):.1f}")
+            else:
+                # weights.pth only (just state dict)
+                q_network.load_state_dict(checkpoint)
+                target_network.load_state_dict(checkpoint)
+                print(f"✓ Loaded network weights only")
+            
+            print(f"{'='*60}\n")
+        else:
+            print(f"\n⚠️  WARNING: Checkpoint not found: {checkpoint_path}")
+            print(f"   Starting training from scratch instead.\n")
     
     # Prioritized replay buffer
     replay = PrioritizedReplay(
@@ -1940,7 +2081,7 @@ def main():
                 # Convert to tensors and move to device
                 s_t = torch.from_numpy(s_batch).to(device)
                 a_t = torch.from_numpy(a_batch).to(device)
-                r_t = 0.01*torch.from_numpy(r_batch).to(device)
+                r_t = torch.from_numpy(r_batch).to(device)
                 s2_t = torch.from_numpy(s2_batch).to(device)
                 d_t = torch.from_numpy(d_batch).to(device)
                 w_t = torch.from_numpy(weights).to(device)
