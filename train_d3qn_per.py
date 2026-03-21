@@ -64,7 +64,7 @@ def run_episode_worker(args):
     
     This runs in a separate process to avoid Python GIL.
     """
-    obelix_module_path, episode_config, policy_fn_data = args
+    obelix_module_path, episode_config, policy_fn_data, reward_shaping_config = args
     
     # Import OBELIX in worker process
     import importlib.util
@@ -148,15 +148,32 @@ def run_episode_worker(args):
         # Step
         next_state, reward, done = env.step(ACTIONS[action_idx], render=False)
         
+        # REWARD SHAPING (if enabled)
+        base_reward = reward
+        shaped_reward = reward
+        
+        if reward_shaping_config['enabled']:
+            # 1. Bonus for moving forward
+            if action_idx == 2:  # FW action
+                shaped_reward += reward_shaping_config['forward_bonus']
+            
+            # 2. Bonus for ANY sensor activation
+            if np.any(next_state[:16] == 1):  # Any sonar sensor active
+                shaped_reward += reward_shaping_config['sensor_bonus']
+            
+            # 3. Extra bonus for IR sensor
+            if next_state[16] == 1:  # IR sensor
+                shaped_reward += reward_shaping_config['ir_bonus']
+        
         # Store
         episode_data['transitions'].append({
             's': state.copy(),
             'a': action_idx,
-            'r': float(reward),
+            'r': float(shaped_reward),  # Use shaped reward
             's2': next_state.copy(),
             'done': bool(done)
         })
-        episode_data['rewards'].append(reward)
+        episode_data['rewards'].append(base_reward)  # Track base reward for metrics
         episode_data['actions'].append(action_idx)
         episode_data['q_values'].append(q_vals.copy())
         episode_data['states'].append(state.copy())
@@ -180,12 +197,13 @@ class ParallelEnvironmentRunner:
         print(f"🔧 Parallel runner using {self.num_workers} workers")
     
     def run_episodes_parallel(self, obelix_path: str, network_state: dict, 
-                            episode_configs: List[dict], policy_data: tuple) -> List[dict]:
+                            episode_configs: List[dict], policy_data: tuple,
+                            reward_shaping_config: dict) -> List[dict]:
         """Run multiple episodes in parallel."""
         
         # Prepare arguments for workers
         worker_args = [
-            (obelix_path, config, policy_data)
+            (obelix_path, config, policy_data, reward_shaping_config)
             for config in episode_configs
         ]
         
@@ -209,7 +227,7 @@ class BatchedExperienceCollector:
     
     def collect_batch(self, obelix_path: str, network, env_params: dict,
                      seeds: List[int], epsilon: float, max_steps: int,
-                     hidden_dim: int, device) -> List[dict]:
+                     hidden_dim: int, device, reward_shaping_config: dict) -> List[dict]:
         """Collect a batch of episodes in parallel."""
         
         # Prepare network state for serialization
@@ -228,7 +246,8 @@ class BatchedExperienceCollector:
         
         # Run in parallel
         return self.runner.run_episodes_parallel(obelix_path, network_state, 
-                                                episode_configs, policy_data)
+                                                episode_configs, policy_data,
+                                                reward_shaping_config)
     
     def shutdown(self):
         self.runner.shutdown()
@@ -1611,7 +1630,7 @@ def main():
     # D3QN-PER hyperparameters
     ap.add_argument("--gamma", type=float, default=0.999, help="Discount factor")
     ap.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
-    ap.add_argument("--batch", type=int, default=256, help="Batch size")
+    ap.add_argument("--batch", type=int, default=128, help="Batch size")
     ap.add_argument("--replay_capacity", type=int, default=100000, help="Replay buffer capacity")
     ap.add_argument("--hidden_dim", type=int, default=64, help="Hidden layer dimension")
     ap.add_argument("--warmup", type=int, default=2000, help="Warmup steps before training")
@@ -1632,6 +1651,17 @@ def main():
                    help="Enable multi-seed training (cycles through seeds for better generalization)")
     ap.add_argument("--seed_list", type=int, nargs='+', default=[42, 123, 456, 789, 999],
                    help="List of seeds to cycle through if multi_seed enabled")
+    
+    # Reward shaping for sparse reward problems (CRITICAL for OBELIX)
+    ap.add_argument("--reward_shaping", action="store_true",
+                   help="Enable reward shaping to help agent learn in sparse reward environment")
+    ap.add_argument("--shape_forward_bonus", type=float, default=0.0005,
+                   help="Bonus reward for moving forward (encourages exploration)")
+    ap.add_argument("--shape_sensor_bonus", type=float, default=0.0020,
+                   help="Bonus reward when any sensor activates (finding box area)")
+    ap.add_argument("--shape_ir_bonus", type=float, default=0.0050,
+                   help="Bonus reward for IR sensor activation (very close to box)")
+    
     ap.add_argument("--save_freq", type=int, default=250, help="Save model every N episodes")
     
     args = ap.parse_args()
@@ -1687,6 +1717,13 @@ def main():
     print(f"Wall Obstacles: {args.wall_obstacles}")
     print(f"Device: {device}")
     print(f"Mixed Precision: {use_amp}")
+    if args.reward_shaping:
+        print(f"Reward Shaping: ENABLED ⚡")
+        print(f"  - Forward bonus: +{args.shape_forward_bonus}")
+        print(f"  - Sensor bonus: +{args.shape_sensor_bonus}")
+        print(f"  - IR bonus: +{args.shape_ir_bonus}")
+    else:
+        print(f"Reward Shaping: DISABLED (raw environment rewards)")
     print(f"{'='*60}\n")
     
     # Import environment
@@ -1731,6 +1768,14 @@ def main():
         'box_speed': args.box_speed,
     }
     
+    # Reward shaping configuration
+    reward_shaping_config = {
+        'enabled': args.reward_shaping,
+        'forward_bonus': args.shape_forward_bonus,
+        'sensor_bonus': args.shape_sensor_bonus,
+        'ir_bonus': args.shape_ir_bonus,
+    }
+    
     # Metrics tracker
     metrics = TrainingMetrics(window_size=100)
     
@@ -1768,7 +1813,8 @@ def main():
                 epsilon=epsilon,
                 max_steps=args.max_steps,
                 hidden_dim=args.hidden_dim,
-                device=device
+                device=device,
+                reward_shaping_config=reward_shaping_config
             )
             
             # Process all episodes in the batch
@@ -1842,20 +1888,37 @@ def main():
                 # Take action
                 next_state, reward, done = env.step(ACTIONS[action_idx], render=False)
                 
-                # Check success (attached box reached boundary)
-                episode_success = done and reward > 0
+                # REWARD SHAPING (if enabled) - helps with sparse reward problem
+                base_reward = reward
+                shaped_reward = reward
                 
-                # Store transition
+                if args.reward_shaping:
+                    # 1. Bonus for moving forward (encourages exploration)
+                    if action_idx == 2:  # FW action
+                        shaped_reward += args.shape_forward_bonus
+                    
+                    # 2. Bonus for ANY sensor activation (robot is near box)
+                    if np.any(next_state[:16] == 1):  # Any of 16 sonar sensors active
+                        shaped_reward += args.shape_sensor_bonus
+                    
+                    # 3. Extra bonus for IR sensor (robot is very close/aligned with box)
+                    if next_state[16] == 1:  # IR sensor (index 16)
+                        shaped_reward += args.shape_ir_bonus
+                
+                # Check success (attached box reached boundary)
+                episode_success = done and base_reward > 0  # Use base reward for success check
+                
+                # Store transition with shaped reward
                 replay.add(Transition(
                     s=state,
                     a=action_idx,
-                    r=float(reward),
+                    r=float(shaped_reward),  # Use shaped reward for training
                     s2=next_state,
                     done=bool(done)
                 ))
                 
-                # Track metrics
-                metrics.step(reward, action_idx, q_values, state, is_greedy)
+                # Track metrics with BASE reward (to see true performance)
+                metrics.step(base_reward, action_idx, q_values, state, is_greedy)
                 state = next_state
                 total_steps += 1
                 
@@ -1877,7 +1940,7 @@ def main():
                 # Convert to tensors and move to device
                 s_t = torch.from_numpy(s_batch).to(device)
                 a_t = torch.from_numpy(a_batch).to(device)
-                r_t = torch.from_numpy(r_batch).to(device)
+                r_t = 0.01*torch.from_numpy(r_batch).to(device)
                 s2_t = torch.from_numpy(s2_batch).to(device)
                 d_t = torch.from_numpy(d_batch).to(device)
                 w_t = torch.from_numpy(weights).to(device)
