@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-PPO (Proximal Policy Optimization) Training for OBELIX
-HIGHLY OPTIMIZED FOR CPU with Parallel Rollout Collection
+ADAPTIVE PPO with Anti-Forgetting Mechanisms
 
-Key Features:
-1. Parallel rollout collection (8x speedup!)
-2. Conditional reward shaping (fixes D3QN-PER action bias)
-3. On-policy learning (no catastrophic forgetting)
-4. Entropy regularization (better exploration)
+FIXES FOR YOUR TRAINING FAILURES:
+1. Adaptive entropy (prevents collapse)
+2. Intrinsic curiosity (keeps exploring)
+3. Progressive rewards (learns step-by-step)
+4. Success memory (remembers good episodes)
+5. Auto LR decay (when stuck)
 """
 
 import os
@@ -17,10 +17,8 @@ import random
 import argparse
 import importlib.util
 from pathlib import Path
-from typing import List, Dict, Tuple
-from dataclasses import dataclass
 from collections import deque
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 
 import numpy as np
 import torch
@@ -32,31 +30,25 @@ from torch.distributions import Categorical
 ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
 
 # ============================================================================
-# PARALLEL WORKER FUNCTION (runs in separate process)
+# ADAPTIVE WORKER WITH CURIOSITY
 # ============================================================================
 
 def parallel_rollout_worker(args_tuple):
-    """
-    Worker function for parallel rollout collection.
-    Runs in separate process to bypass Python GIL.
-    
-    This is the KEY optimization that gives 8x speedup!
-    """
+    """Worker with curiosity and progress tracking."""
     (obelix_path, env_config, policy_state, num_steps, seed, 
-     reward_shaping_config, hidden_dim) = args_tuple
+     config, hidden_dim) = args_tuple
     
-    # Import OBELIX in worker process
     import importlib.util
     spec = importlib.util.spec_from_file_location("obelix_env", obelix_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     OBELIX = mod.OBELIX
     
-    # Recreate policy network in worker
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
     from torch.distributions import Categorical
+    from collections import deque
     
     class ActorCritic(nn.Module):
         def __init__(self, in_dim=18, n_actions=5, hidden_dim=128):
@@ -86,43 +78,44 @@ def parallel_rollout_worker(args_tuple):
             value = self.critic(features)
             return logits, value
     
-    # Load policy weights
     policy = ActorCritic(hidden_dim=hidden_dim)
     policy.load_state_dict(policy_state)
     policy.eval()
     
-    # Create environment
     env = OBELIX(**env_config)
     state = env.reset(seed=seed)
     
-    # Storage
-    states = []
-    actions = []
-    log_probs = []
-    rewards = []
-    dones = []
-    values = []
-    
-    episode_returns = []
-    episode_lengths = []
-    episode_successes = []
+    states, actions, log_probs, rewards, dones, values = [], [], [], [], [], []
+    episode_returns, episode_lengths, episode_successes = [], [], []
     
     episode_reward = 0
     episode_length = 0
     
-    # Reward shaping state
-    if reward_shaping_config['enabled']:
-        prev_sensor_count = 0
-        decay_factor = 1.0
+    # CURIOSITY: Track visited states
+    visited_state_hashes = set()
     
-    # Collect rollout
+    # PROGRESS: Track best sensor count seen
+    best_sensor_count = 0
+    steps_since_improvement = 0
+    
+    # MEMORY: Track recent actions to detect loops
+    action_memory = deque(maxlen=8)
+    
     for step in range(num_steps):
-        # Get action from policy
         state_t = torch.FloatTensor(state).unsqueeze(0)
         
         with torch.no_grad():
             logits, value = policy(state_t)
             probs = F.softmax(logits, dim=-1)
+            
+            # ANTI-LOOP: Reduce probability of repeated actions
+            if len(action_memory) >= 4:
+                recent_actions = list(action_memory)[-4:]
+                if len(set(recent_actions)) == 1:  # All same
+                    repeated_action = recent_actions[0]
+                    probs[0, repeated_action] *= 0.3
+                    probs = probs / probs.sum()
+            
             dist = Categorical(probs)
             action_idx = dist.sample()
             log_prob = dist.log_prob(action_idx)
@@ -131,42 +124,60 @@ def parallel_rollout_worker(args_tuple):
         log_prob = log_prob.item()
         value = value.item()
         
-        # Take action in environment
         next_state, reward, done = env.step(ACTIONS[action_idx], render=False)
         
-        # Apply conditional reward shaping
+        # REWARD SHAPING
         shaped_reward = reward
-        if reward_shaping_config['enabled']:
-            curr_sensor_count = np.sum(next_state[:16] == 1)
-            
-            # Sensor activation bonus
-            if curr_sensor_count > 0:
-                shaped_reward += reward_shaping_config['sensor_bonus'] * decay_factor
-            
-            # IR sensor bonus
-            if next_state[16] == 1:
-                shaped_reward += reward_shaping_config['ir_bonus'] * decay_factor
-            
-            # CRITICAL: Approach/retreat detection (NO blind forward bonus!)
-            if curr_sensor_count > prev_sensor_count:
-                shaped_reward += reward_shaping_config['approach_bonus'] * decay_factor
-            elif curr_sensor_count < prev_sensor_count and prev_sensor_count > 0:
-                shaped_reward -= reward_shaping_config['retreat_penalty'] * decay_factor
-            
-            prev_sensor_count = curr_sensor_count
-            decay_factor *= reward_shaping_config['decay_rate']
         
-        # Store transition
-        states.append(state.copy())  # IMPORTANT: Copy state!
+        # 1. MASSIVE SUCCESS BONUS
+        if done and reward > 0:
+            shaped_reward += config['success_bonus']
+        
+        # 2. CURIOSITY BONUS (exploring new states)
+        state_hash = hash(tuple(next_state))
+        if state_hash not in visited_state_hashes:
+            shaped_reward += config['curiosity_bonus']
+            visited_state_hashes.add(state_hash)
+        
+        # 3. PROGRESS BONUS (getting closer to box)
+        curr_sensor_count = np.sum(next_state[:16] == 1)
+        if curr_sensor_count > best_sensor_count:
+            improvement = curr_sensor_count - best_sensor_count
+            shaped_reward += config['progress_bonus'] * improvement
+            best_sensor_count = curr_sensor_count
+            steps_since_improvement = 0
+        else:
+            steps_since_improvement += 1
+        
+        # 4. IR BONUS (very close to box)
+        if next_state[16] == 1:
+            shaped_reward += config['ir_bonus']
+        
+        # 5. ATTACHMENT BONUS (box attached!)
+        if next_state[17] == 1:
+            shaped_reward += config['attachment_bonus']
+        
+        # 6. STAGNATION PENALTY (not making progress)
+        if steps_since_improvement > 50:
+            shaped_reward -= config['stagnation_penalty']
+        
+        # 7. LOOP PENALTY (repeating actions)
+        if len(action_memory) >= 8:
+            unique_actions = len(set(action_memory))
+            if unique_actions <= 2:  # Very repetitive
+                shaped_reward -= config['loop_penalty']
+        
+        action_memory.append(action_idx)
+        
+        states.append(state.copy())
         actions.append(action_idx)
         log_probs.append(log_prob)
         rewards.append(shaped_reward)
         dones.append(done)
         values.append(value)
         
-        episode_reward += reward  # Track base reward
+        episode_reward += reward
         episode_length += 1
-        
         state = next_state
         
         if done:
@@ -174,13 +185,14 @@ def parallel_rollout_worker(args_tuple):
             episode_returns.append(episode_reward)
             episode_lengths.append(episode_length)
             
-            # Reset for next episode
-            state = env.reset(seed=seed + len(episode_returns))  # Different seed for each episode
+            # Reset
+            state = env.reset(seed=seed + len(episode_returns))
             episode_reward = 0
             episode_length = 0
-            
-            if reward_shaping_config['enabled']:
-                prev_sensor_count = 0
+            visited_state_hashes.clear()
+            action_memory.clear()
+            best_sensor_count = 0
+            steps_since_improvement = 0
     
     return {
         'states': np.array(states),
@@ -195,68 +207,32 @@ def parallel_rollout_worker(args_tuple):
     }
 
 # ============================================================================
-# UTILITY FUNCTIONS
+# UTILS
 # ============================================================================
 
 def import_obelix(path: str):
-    """Import OBELIX environment from path."""
     spec = importlib.util.spec_from_file_location("obelix_env", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.OBELIX
 
-def get_device():
-    """Get best available device."""
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        torch.backends.cudnn.benchmark = True
-        print(f"🚀 Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        device = torch.device("cpu")
-        torch.set_num_threads(os.cpu_count() or 4)
-        print(f"💻 Using CPU with {torch.get_num_threads()} threads")
-    return device
-
 def compute_gae(rewards, values, dones, gamma=0.99, gae_lambda=0.95):
-    """Compute Generalized Advantage Estimation."""
     advantages = np.zeros_like(rewards)
     last_gae = 0
-    
     for t in reversed(range(len(rewards))):
-        if t == len(rewards) - 1:
-            next_value = 0
-        else:
-            next_value = values[t + 1]
-        
+        next_value = 0 if t == len(rewards) - 1 else values[t + 1]
         delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
         advantages[t] = last_gae = delta + gamma * gae_lambda * (1 - dones[t]) * last_gae
-    
     returns = advantages + values
     return advantages, returns
 
 # ============================================================================
-# NEURAL NETWORK
+# NETWORK
 # ============================================================================
 
-@dataclass
-class RolloutBatch:
-    """Store rollout data for PPO update."""
-    states: np.ndarray
-    actions: np.ndarray
-    log_probs: np.ndarray
-    rewards: np.ndarray
-    dones: np.ndarray
-    values: np.ndarray
-    advantages: np.ndarray
-    returns: np.ndarray
-
 class ActorCritic(nn.Module):
-    """Actor-Critic network for PPO."""
-    
     def __init__(self, in_dim=18, n_actions=5, hidden_dim=128):
         super().__init__()
-        
-        # Shared feature extractor
         self.feature = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -265,22 +241,16 @@ class ActorCritic(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
         )
-        
-        # Actor head (policy)
         self.actor = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, n_actions),
         )
-        
-        # Critic head (value function)
         self.critic = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 1),
         )
-        
-        # Initialize weights
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
@@ -293,191 +263,109 @@ class ActorCritic(nn.Module):
         logits = self.actor(features)
         value = self.critic(features)
         return logits, value
-    
-    def get_action_and_value(self, x, action=None):
-        logits, value = self.forward(x)
-        probs = F.softmax(logits, dim=-1)
-        dist = Categorical(probs)
-        
-        if action is None:
-            action = dist.sample()
-        
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-        
-        return action, log_prob, entropy, value
 
 # ============================================================================
-# PPO TRAINER
+# ADAPTIVE TRAINER
 # ============================================================================
 
-class PPOTrainer:
-    """PPO trainer with parallel rollout collection."""
-    
+class AdaptivePPOTrainer:
     def __init__(self, args, device):
         self.args = args
         self.device = device
         
-        # Initialize network
-        self.policy = ActorCritic(
-            in_dim=18,
-            n_actions=5,
-            hidden_dim=args.hidden_dim
-        ).to(device)
-        
-        # Optimizer
+        self.policy = ActorCritic(18, 5, args.hidden_dim).to(device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=args.lr, eps=1e-5)
         
-        # Metrics
+        # LR scheduler (decay when stuck)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='max', factor=0.5, patience=50
+        )
+        
         self.episode_returns = deque(maxlen=100)
         self.episode_lengths = deque(maxlen=100)
         self.episode_successes = deque(maxlen=100)
         
-        # Training stats
         self.policy_losses = []
         self.value_losses = []
         self.entropies = []
+        
+        # ANTI-FORGETTING: Track best success rate
+        self.best_success_rate = 0.0
+        self.best_policy_state = None
+        self.updates_since_improvement = 0
+        
+        # ADAPTIVE ENTROPY: Start high, decay over time
+        self.current_ent_coef = args.ent_coef_start
     
     def collect_rollout(self, env_config, num_steps):
-        """Collect rollout using parallel workers."""
         if self.args.num_workers > 1:
             return self._collect_parallel(env_config, num_steps)
         else:
-            return self._collect_sequential(env_config, num_steps)
+            raise NotImplementedError("Use parallel mode")
     
     def _collect_parallel(self, env_config, num_steps):
-        """Parallel rollout collection (8x faster!)."""
-        # Each worker collects FULL rollout, not divided
-        # This ensures each worker completes full episodes
-        steps_per_worker = num_steps
-        
-        # Get policy state for workers
         policy_state = {k: v.cpu() for k, v in self.policy.state_dict().items()}
         
-        # Reward shaping config
-        reward_config = {
-            'enabled': self.args.reward_shaping,
-            'sensor_bonus': self.args.shape_sensor_bonus,
-            'ir_bonus': self.args.shape_ir_bonus,
-            'approach_bonus': self.args.shape_approach_bonus,
-            'retreat_penalty': self.args.shape_retreat_penalty,
-            'decay_rate': self.args.shape_decay_rate,
+        config = {
+            'success_bonus': self.args.success_bonus,
+            'curiosity_bonus': self.args.curiosity_bonus,
+            'progress_bonus': self.args.progress_bonus,
+            'ir_bonus': self.args.ir_bonus,
+            'attachment_bonus': self.args.attachment_bonus,
+            'stagnation_penalty': self.args.stagnation_penalty,
+            'loop_penalty': self.args.loop_penalty,
         }
         
-        # Prepare worker arguments - each worker does full rollout
         worker_args = []
         for i in range(self.args.num_workers):
-            # Use different seed for each worker for diversity
-            if self.args.multi_seed:
-                seed = self.args.seed_list[i % len(self.args.seed_list)] + i * 1000
-            else:
-                seed = self.args.seed + i * 1000
-            
+            seed = self.args.seed + i * 1000
             worker_args.append((
-                self.args.obelix_py,
-                env_config,
-                policy_state,
-                steps_per_worker,
-                seed,
-                reward_config,
-                self.args.hidden_dim
+                self.args.obelix_py, env_config, policy_state,
+                num_steps, seed, config, self.args.hidden_dim
             ))
         
-        # Run in parallel - take only first worker's result
-        # (All workers collect same amount, we just use one to avoid overshoot)
         with Pool(processes=self.args.num_workers) as pool:
             results = pool.map(parallel_rollout_worker, worker_args)
         
-        # Use first worker's result (they all collect same policy)
         result = results[0]
-        
-        # Track episode metrics from all workers for better statistics
         for r in results:
             self.episode_returns.extend(r['episode_returns'])
             self.episode_lengths.extend(r['episode_lengths'])
             self.episode_successes.extend(r['episode_successes'])
         
-        # Compute advantages
         advantages, returns = compute_gae(
             result['rewards'], result['values'], result['dones'],
-            gamma=self.args.gamma,
-            gae_lambda=self.args.gae_lambda
+            self.args.gamma, self.args.gae_lambda
         )
+        
+        from dataclasses import dataclass
+        
+        @dataclass
+        class RolloutBatch:
+            states: np.ndarray
+            actions: np.ndarray
+            log_probs: np.ndarray
+            rewards: np.ndarray
+            dones: np.ndarray
+            values: np.ndarray
+            advantages: np.ndarray
+            returns: np.ndarray
         
         return RolloutBatch(
-            states=result['states'],
-            actions=result['actions'],
-            log_probs=result['log_probs'],
-            rewards=result['rewards'],
-            dones=result['dones'],
-            values=result['values'],
-            advantages=advantages,
-            returns=returns
+            result['states'], result['actions'], result['log_probs'],
+            result['rewards'], result['dones'], result['values'],
+            advantages, returns
         )
     
-    def _collect_sequential(self, env_config, num_steps):
-        """Sequential rollout (fallback if num_workers=1)."""
-        OBELIX = import_obelix(self.args.obelix_py)
-        env = OBELIX(**env_config)
-        state = env.reset(seed=random.choice(self.args.seed_list if self.args.multi_seed else [self.args.seed]))
-        
-        states, actions, log_probs, rewards, dones, values = [], [], [], [], [], []
-        episode_reward, episode_length = 0, 0
-        
-        for step in range(num_steps):
-            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            
-            with torch.no_grad():
-                action_idx, log_prob, _, value = self.policy.get_action_and_value(state_t)
-            
-            action_idx = action_idx.item()
-            log_prob = log_prob.item()
-            value = value.item()
-            
-            next_state, reward, done = env.step(ACTIONS[action_idx], render=False)
-            
-            states.append(state)
-            actions.append(action_idx)
-            log_probs.append(log_prob)
-            rewards.append(reward)
-            dones.append(done)
-            values.append(value)
-            
-            episode_reward += reward
-            episode_length += 1
-            state = next_state
-            
-            if done:
-                self.episode_returns.append(episode_reward)
-                self.episode_lengths.append(episode_length)
-                self.episode_successes.append(reward > 0)
-                state = env.reset(seed=random.choice(self.args.seed_list if self.args.multi_seed else [self.args.seed]))
-                episode_reward, episode_length = 0, 0
-        
-        states = np.array(states)
-        actions = np.array(actions)
-        log_probs = np.array(log_probs)
-        rewards = np.array(rewards)
-        dones = np.array(dones)
-        values = np.array(values)
-        
-        advantages, returns = compute_gae(rewards, values, dones, self.args.gamma, self.args.gae_lambda)
-        
-        return RolloutBatch(states, actions, log_probs, rewards, dones, values, advantages, returns)
-    
-    def update(self, batch: RolloutBatch):
-        """PPO update."""
-        # Normalize advantages
+    def update(self, batch):
         advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
         
-        # Convert to tensors
         states_t = torch.FloatTensor(batch.states).to(self.device)
         actions_t = torch.LongTensor(batch.actions).to(self.device)
         old_log_probs_t = torch.FloatTensor(batch.log_probs).to(self.device)
         advantages_t = torch.FloatTensor(advantages).to(self.device)
         returns_t = torch.FloatTensor(batch.returns).to(self.device)
         
-        # Multiple epochs
         for epoch in range(self.args.ppo_epochs):
             indices = torch.randperm(len(states_t))
             
@@ -492,31 +380,26 @@ class PPOTrainer:
                 log_probs = dist.log_prob(actions_t[idx])
                 entropy = dist.entropy().mean()
                 
-                # PPO clipped objective
                 ratio = torch.exp(log_probs - old_log_probs_t[idx])
                 surr1 = ratio * advantages_t[idx]
                 surr2 = torch.clamp(ratio, 1 - self.args.clip_coef, 1 + self.args.clip_coef) * advantages_t[idx]
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
-                # Value loss
                 value_loss = F.mse_loss(values.squeeze(), returns_t[idx])
                 
-                # Total loss
-                loss = policy_loss + self.args.vf_coef * value_loss - self.args.ent_coef * entropy
+                # ADAPTIVE ENTROPY
+                loss = policy_loss + self.args.vf_coef * value_loss - self.current_ent_coef * entropy
                 
-                # Optimize
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), self.args.max_grad_norm)
                 self.optimizer.step()
                 
-                # Track metrics
                 self.policy_losses.append(policy_loss.item())
                 self.value_losses.append(value_loss.item())
                 self.entropies.append(entropy.item())
     
     def train(self):
-        """Main training loop."""
         env_config = {
             'scaling_factor': self.args.scaling_factor,
             'arena_size': self.args.arena_size,
@@ -526,71 +409,89 @@ class PPOTrainer:
             'box_speed': self.args.box_speed,
         }
         
-        print("🚀 Starting PPO training...\n")
+        print("🚀 Starting ADAPTIVE PPO training...\n")
         start_time = time.time()
         
         num_updates = self.args.total_timesteps // self.args.rollout_steps
         
         for update in range(num_updates):
-            # Collect rollout
             batch = self.collect_rollout(env_config, self.args.rollout_steps)
-            
-            # Update policy
             self.update(batch)
             
-            # Logging
+            # ADAPTIVE ENTROPY DECAY
+            self.current_ent_coef = max(
+                self.args.ent_coef_end,
+                self.current_ent_coef * self.args.ent_coef_decay
+            )
+            
+            # Check for improvement
+            current_success = np.mean(self.episode_successes) if self.episode_successes else 0
+            
+            if current_success > self.best_success_rate:
+                self.best_success_rate = current_success
+                self.best_policy_state = {k: v.cpu().clone() for k, v in self.policy.state_dict().items()}
+                self.updates_since_improvement = 0
+                print(f"🎯 NEW BEST! Success: {current_success*100:.1f}%")
+            else:
+                self.updates_since_improvement += 1
+            
+            # ANTI-FORGETTING: Restore best if stuck too long
+            if self.updates_since_improvement > 100 and self.best_policy_state is not None:
+                print(f"⚠️  RESTORING BEST POLICY (stuck for 100 updates)")
+                self.policy.load_state_dict({k: v.to(self.device) for k, v in self.best_policy_state.items()})
+                self.updates_since_improvement = 0
+                self.current_ent_coef = self.args.ent_coef_start  # Reset exploration
+            
+            # LR scheduling
+            self.scheduler.step(current_success)
+            
             if (update + 1) % self.args.log_interval == 0:
                 elapsed = time.time() - start_time
                 mean_return = np.mean(self.episode_returns) if self.episode_returns else 0
                 std_return = np.std(self.episode_returns) if self.episode_returns else 0
                 mean_length = np.mean(self.episode_lengths) if self.episode_lengths else 0
-                success_rate = np.mean(self.episode_successes) if self.episode_successes else 0
                 
                 print(f"Update {update+1:4d}/{num_updates} | "
                       f"Return: {mean_return:8.1f} ± {std_return:6.1f} | "
                       f"Length: {mean_length:5.1f} | "
-                      f"Success: {success_rate*100:5.1f}% | "
+                      f"Success: {current_success*100:5.1f}% | "
                       f"Entropy: {np.mean(self.entropies[-100:]) if self.entropies else 0:5.3f} | "
+                      f"EntCoef: {self.current_ent_coef:.4f} | "
+                      f"LR: {self.optimizer.param_groups[0]['lr']:.6f} | "
                       f"Time: {elapsed/60:.1f}m")
             
-            # Save checkpoint
             if (update + 1) % self.args.save_interval == 0:
                 self.save_checkpoint(update + 1)
         
-        # Final save
         self.save_checkpoint(num_updates, final=True)
         
-        print(f"\n{'='*60}")
+        print(f"\n{'='*70}")
         print(f"✅ Training Complete!")
-        print(f"{'='*60}")
+        print(f"{'='*70}")
         print(f"Time: {(time.time() - start_time)/60:.1f} minutes")
-        print(f"Final Success Rate: {np.mean(self.episode_successes)*100:.1f}%")
-        print(f"Final Return: {np.mean(self.episode_returns):.1f}")
+        print(f"Best Success Rate: {self.best_success_rate*100:.1f}%")
+        print(f"Final Success Rate: {current_success*100:.1f}%")
     
     def save_checkpoint(self, update, final=False):
-        """Save model checkpoint."""
         submission_dir = Path(f"submission_{self.args.agent_id}")
         submission_dir.mkdir(exist_ok=True)
         
         if final:
-            torch.save(self.policy.state_dict(), submission_dir / "weights.pth")
-            
-            # Copy agent file
-            agent_src = Path(__file__).parent / "agent_ppo.py"
-            if agent_src.exists():
-                import shutil
-                shutil.copy(agent_src, submission_dir / "agent_ppo.py")
-            
-            print(f"✓ Final model saved to {submission_dir}/weights.pth")
+            # Save best policy, not final
+            if self.best_policy_state is not None:
+                torch.save(self.best_policy_state, submission_dir / "weights.pth")
+                print(f"✓ BEST model saved (Success: {self.best_success_rate*100:.1f}%)")
+            else:
+                torch.save(self.policy.state_dict(), submission_dir / "weights.pth")
+                print(f"✓ Final model saved")
         else:
             checkpoint = {
                 'policy_state_dict': self.policy.state_dict(),
+                'best_policy_state_dict': self.best_policy_state,
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'update': update,
-                'stats': {
-                    'mean_return': np.mean(self.episode_returns) if self.episode_returns else 0,
-                    'success_rate': np.mean(self.episode_successes) if self.episode_successes else 0,
-                }
+                'best_success_rate': self.best_success_rate,
+                'current_ent_coef': self.current_ent_coef,
             }
             torch.save(checkpoint, submission_dir / f"checkpoint_update{update}.pth")
 
@@ -599,11 +500,11 @@ class PPOTrainer:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='PPO Training for OBELIX (CPU-OPTIMIZED)')
+    parser = argparse.ArgumentParser()
     
     # Environment
     parser.add_argument("--obelix_py", type=str, required=True)
-    parser.add_argument("--agent_id", type=str, default="ppo_001")
+    parser.add_argument("--agent_id", type=str, default="ppo_adaptive")
     parser.add_argument("--difficulty", type=int, default=0)
     parser.add_argument("--wall_obstacles", action="store_true")
     parser.add_argument("--box_speed", type=int, default=2)
@@ -612,81 +513,64 @@ def main():
     parser.add_argument("--max_steps", type=int, default=2000)
     
     # Training
-    parser.add_argument("--total_timesteps", type=int, default=2000000)
+    parser.add_argument("--total_timesteps", type=int, default=1000000)
     parser.add_argument("--rollout_steps", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--ppo_epochs", type=int, default=10)
-    parser.add_argument("--num_workers", type=int, default=6, help="Parallel workers (KEY OPTIMIZATION!)")
+    parser.add_argument("--num_workers", type=int, default=6)
     
-    # PPO hyperparameters
+    # PPO
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument("--clip_coef", type=float, default=0.2)
     parser.add_argument("--vf_coef", type=float, default=0.5)
-    parser.add_argument("--ent_coef", type=float, default=0.01)
+    parser.add_argument("--ent_coef_start", type=float, default=0.05, help="Start entropy coef")
+    parser.add_argument("--ent_coef_end", type=float, default=0.001, help="End entropy coef")
+    parser.add_argument("--ent_coef_decay", type=float, default=0.999, help="Entropy decay rate")
     parser.add_argument("--max_grad_norm", type=float, default=0.5)
     parser.add_argument("--hidden_dim", type=int, default=128)
     
-    # Reward shaping (CONDITIONAL - fixes D3QN-PER issues!)
-    parser.add_argument("--reward_shaping", action="store_true")
-    parser.add_argument("--shape_sensor_bonus", type=float, default=2.0)
-    parser.add_argument("--shape_ir_bonus", type=float, default=5.0)
-    parser.add_argument("--shape_approach_bonus", type=float, default=1.0)
-    parser.add_argument("--shape_retreat_penalty", type=float, default=0.5)
-    parser.add_argument("--shape_decay_rate", type=float, default=0.9999)
+    # REWARDS
+    parser.add_argument("--success_bonus", type=float, default=250000)
+    parser.add_argument("--curiosity_bonus", type=float, default=5)
+    parser.add_argument("--progress_bonus", type=float, default=100)
+    parser.add_argument("--ir_bonus", type=float, default=50)
+    parser.add_argument("--attachment_bonus", type=float, default=1000)
+    parser.add_argument("--stagnation_penalty", type=float, default=10)
+    parser.add_argument("--loop_penalty", type=float, default=50)
     
-    # Multi-seed
+    # Misc
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--multi_seed", action="store_true")
-    parser.add_argument("--seed_list", type=int, nargs='+', default=[42, 123, 456, 789, 999])
-    
-    # Device
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
-    
-    # Logging
+    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=100)
     
     args = parser.parse_args()
     
-    # Device setup
-    if args.device == "auto":
-        device = get_device()
-    else:
-        device = torch.device(args.device)
-        if device.type == "cpu":
-            torch.set_num_threads(os.cpu_count() or 4)
+    device = torch.device(args.device)
+    if device.type == "cpu":
+        torch.set_num_threads(os.cpu_count() or 4)
     
-    # Set seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
-    # Print configuration
-    print(f"\n{'='*60}")
-    print(f"PPO Training for OBELIX (CPU-OPTIMIZED)")
-    print(f"{'='*60}")
+    print(f"\n{'='*70}")
+    print(f"ADAPTIVE PPO - Anti-Forgetting + Curiosity + Progress")
+    print(f"{'='*70}")
     print(f"Agent ID: {args.agent_id}")
     print(f"Total Timesteps: {args.total_timesteps:,}")
-    print(f"Rollout Steps: {args.rollout_steps}")
-    if args.num_workers > 1:
-        print(f"Parallel Workers: {args.num_workers} ⚡ (Expected {args.num_workers}x speedup!)")
-    else:
-        print(f"Parallel Workers: DISABLED (sequential mode)")
-    print(f"Device: {device}")
-    if args.reward_shaping:
-        print(f"Reward Shaping: ENABLED (CONDITIONAL - no blind forward bias!)")
-        print(f"  - Sensor bonus: +{args.shape_sensor_bonus}")
-        print(f"  - IR bonus: +{args.shape_ir_bonus}")
-        print(f"  - Approach bonus: +{args.shape_approach_bonus} (getting CLOSER)")
-        print(f"  - Retreat penalty: -{args.shape_retreat_penalty} (moving AWAY)")
-    else:
-        print(f"Reward Shaping: DISABLED")
-    print(f"{'='*60}\n")
+    print(f"\n🎯 KEY FEATURES:")
+    print(f"  ✓ Success Bonus: +{args.success_bonus:,}")
+    print(f"  ✓ Curiosity Exploration: +{args.curiosity_bonus} per new state")
+    print(f"  ✓ Progress Rewards: +{args.progress_bonus} per sensor improvement")
+    print(f"  ✓ Adaptive Entropy: {args.ent_coef_start} → {args.ent_coef_end}")
+    print(f"  ✓ Auto LR Decay: Reduces when stuck")
+    print(f"  ✓ Anti-Forgetting: Restores best policy if stuck 100 updates")
+    print(f"{'='*70}\n")
     
-    # Train
-    trainer = PPOTrainer(args, device)
+    trainer = AdaptivePPOTrainer(args, device)
     trainer.train()
 
 if __name__ == "__main__":
