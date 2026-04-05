@@ -19,6 +19,7 @@ import importlib.util
 from pathlib import Path
 from collections import deque
 from multiprocessing import Pool
+import threading
 
 import numpy as np
 import torch
@@ -29,6 +30,67 @@ from torch.distributions import Categorical
 
 ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
 
+_QT_WARNING_PREFIXES = (
+    "QFontDatabase:",
+    "Note that Qt no longer ships fonts.",
+)
+_QT_WARNING_PREFIXES_BYTES = tuple(p.encode("utf-8") for p in _QT_WARNING_PREFIXES)
+
+
+class _QtStderrFilter:
+    def __init__(self, stream):
+        self._stream = stream
+        self._buffer = ""
+
+    def write(self, data):
+        self._buffer += data
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if any(line.startswith(prefix) for prefix in _QT_WARNING_PREFIXES):
+                continue
+            self._stream.write(line + "\n")
+
+    def flush(self):
+        if self._buffer:
+            if not any(self._buffer.startswith(prefix) for prefix in _QT_WARNING_PREFIXES):
+                self._stream.write(self._buffer)
+            self._buffer = ""
+        self._stream.flush()
+
+
+def _start_fd2_filter():
+    original_fd = os.dup(2)
+    read_fd, write_fd = os.pipe()
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
+
+    def _reader():
+        with os.fdopen(read_fd, "rb", buffering=0) as reader, os.fdopen(original_fd, "wb", buffering=0) as writer:
+            buffer = b""
+            while True:
+                chunk = reader.read(1024)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if any(line.startswith(prefix) for prefix in _QT_WARNING_PREFIXES_BYTES):
+                        continue
+                    writer.write(line + b"\n")
+            if buffer and not any(buffer.startswith(prefix) for prefix in _QT_WARNING_PREFIXES_BYTES):
+                writer.write(buffer)
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+
+
+def _configure_worker_logging(render_enabled: bool, worker_id: int):
+    if render_enabled and worker_id == 0:
+        _start_fd2_filter()
+    else:
+        devnull = open(os.devnull, "w")
+        os.dup2(devnull.fileno(), 2)
+
 # ============================================================================
 # ADAPTIVE WORKER WITH CURIOSITY
 # ============================================================================
@@ -36,7 +98,9 @@ ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
 def parallel_rollout_worker(args_tuple):
     """Worker with curiosity and progress tracking."""
     (obelix_path, env_config, policy_state, num_steps, seed, 
-     config, hidden_dim) = args_tuple
+     config, hidden_dim, worker_id, render_enabled) = args_tuple
+
+    _configure_worker_logging(render_enabled, worker_id)
     
     import importlib.util
     spec = importlib.util.spec_from_file_location("obelix_env", obelix_path)
@@ -85,7 +149,7 @@ def parallel_rollout_worker(args_tuple):
     env = OBELIX(**env_config)
     state = env.reset(seed=seed)
     
-    states, actions, log_probs, rewards, dones, values = [], [], [], [], [], []
+    states, actions, log_probs, rewards, dones, values, timeouts = [], [], [], [], [], [], []
     episode_returns, episode_lengths, episode_successes = [], [], []
     
     episode_reward = 0
@@ -124,26 +188,28 @@ def parallel_rollout_worker(args_tuple):
         log_prob = log_prob.item()
         value = value.item()
         
-        next_state, reward, done = env.step(ACTIONS[action_idx], render=False)
+        next_state, reward, done = env.step(ACTIONS[action_idx], render=(render_enabled and worker_id == 0))
+        is_timeout = (episode_length + 1 >= env_config['max_steps']) and done
         
         # REWARD SHAPING
-        shaped_reward = reward
+        base_scaled = reward / 1000.0
+        shaped_reward = base_scaled
         
         # 1. MASSIVE SUCCESS BONUS
-        if done and reward > 0:
-            shaped_reward += config['success_bonus']
+        if done and reward >= config['success_reward_threshold']:
+            shaped_reward += config['success_bonus'] / 100.0
         
         # 2. CURIOSITY BONUS (exploring new states)
         state_hash = hash(tuple(next_state))
         if state_hash not in visited_state_hashes:
-            shaped_reward += config['curiosity_bonus']
+            shaped_reward += config['curiosity_bonus'] / 1000.0
             visited_state_hashes.add(state_hash)
         
         # 3. PROGRESS BONUS (getting closer to box)
         curr_sensor_count = np.sum(next_state[:16] == 1)
         if curr_sensor_count > best_sensor_count:
             improvement = curr_sensor_count - best_sensor_count
-            shaped_reward += config['progress_bonus'] * improvement
+            shaped_reward += (config['progress_bonus'] * improvement) / 1000.0
             best_sensor_count = curr_sensor_count
             steps_since_improvement = 0
         else:
@@ -151,21 +217,23 @@ def parallel_rollout_worker(args_tuple):
         
         # 4. IR BONUS (very close to box)
         if next_state[16] == 1:
-            shaped_reward += config['ir_bonus']
+            shaped_reward += config['ir_bonus'] / 1000.0
         
         # 5. ATTACHMENT BONUS (box attached!)
-        if next_state[17] == 1:
-            shaped_reward += config['attachment_bonus']
+        if (not done and
+                reward >= config['attachment_reward_threshold'] and
+                reward < config['success_reward_threshold']):
+            shaped_reward += config['attachment_bonus'] / 1000.0
         
         # 6. STAGNATION PENALTY (not making progress)
         if steps_since_improvement > 50:
-            shaped_reward -= config['stagnation_penalty']
+            shaped_reward -= config['stagnation_penalty'] / 1000.0
         
         # 7. LOOP PENALTY (repeating actions)
         if len(action_memory) >= 8:
             unique_actions = len(set(action_memory))
             if unique_actions <= 2:  # Very repetitive
-                shaped_reward -= config['loop_penalty']
+                shaped_reward -= config['loop_penalty'] / 1000.0
         
         action_memory.append(action_idx)
         
@@ -174,6 +242,7 @@ def parallel_rollout_worker(args_tuple):
         log_probs.append(log_prob)
         rewards.append(shaped_reward)
         dones.append(done)
+        timeouts.append(is_timeout)
         values.append(value)
         
         episode_reward += reward
@@ -181,7 +250,7 @@ def parallel_rollout_worker(args_tuple):
         state = next_state
         
         if done:
-            episode_successes.append(reward > 0)
+            episode_successes.append(reward >= config['success_reward_threshold'])
             episode_returns.append(episode_reward)
             episode_lengths.append(episode_length)
             
@@ -200,6 +269,7 @@ def parallel_rollout_worker(args_tuple):
         'log_probs': np.array(log_probs),
         'rewards': np.array(rewards),
         'dones': np.array(dones),
+        'timeouts': np.array(timeouts),
         'values': np.array(values),
         'episode_returns': episode_returns,
         'episode_lengths': episode_lengths,
@@ -217,12 +287,28 @@ def import_obelix(path: str):
     return mod.OBELIX
 
 def compute_gae(rewards, values, dones, gamma=0.99, gae_lambda=0.95):
+    raise NotImplementedError("Use compute_gae_with_timeouts")
+
+
+def compute_gae_with_timeouts(rewards, values, dones, timeouts, next_value, gamma=0.99, gae_lambda=0.95):
     advantages = np.zeros_like(rewards)
-    last_gae = 0
+    last_gae = 0.0
     for t in reversed(range(len(rewards))):
-        next_value = 0 if t == len(rewards) - 1 else values[t + 1]
-        delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
-        advantages[t] = last_gae = delta + gamma * gae_lambda * (1 - dones[t]) * last_gae
+        if t == len(rewards) - 1:
+            next_value_t = next_value
+        else:
+            next_value_t = values[t + 1]
+
+        if dones[t]:
+            mask = 1.0 if timeouts[t] else 0.0
+            if not timeouts[t]:
+                next_value_t = 0.0
+        else:
+            mask = 1.0
+
+        delta = rewards[t] + gamma * next_value_t * mask - values[t]
+        advantages[t] = last_gae = delta + gamma * gae_lambda * mask * last_gae
+
     returns = advantages + values
     return advantages, returns
 
@@ -296,6 +382,7 @@ class AdaptivePPOTrainer:
         
         # ADAPTIVE ENTROPY: Start high, decay over time
         self.current_ent_coef = args.ent_coef_start
+        self.total_timesteps = 0
     
     def collect_rollout(self, env_config, num_steps):
         if self.args.num_workers > 1:
@@ -308,10 +395,12 @@ class AdaptivePPOTrainer:
         
         config = {
             'success_bonus': self.args.success_bonus,
+            'success_reward_threshold': self.args.success_reward_threshold,
             'curiosity_bonus': self.args.curiosity_bonus,
             'progress_bonus': self.args.progress_bonus,
             'ir_bonus': self.args.ir_bonus,
             'attachment_bonus': self.args.attachment_bonus,
+            'attachment_reward_threshold': self.args.attachment_reward_threshold,
             'stagnation_penalty': self.args.stagnation_penalty,
             'loop_penalty': self.args.loop_penalty,
         }
@@ -321,22 +410,63 @@ class AdaptivePPOTrainer:
             seed = self.args.seed + i * 1000
             worker_args.append((
                 self.args.obelix_py, env_config, policy_state,
-                num_steps, seed, config, self.args.hidden_dim
+                num_steps, seed, config, self.args.hidden_dim,
+                i, self.args.render
             ))
         
         with Pool(processes=self.args.num_workers) as pool:
             results = pool.map(parallel_rollout_worker, worker_args)
         
-        result = results[0]
+        all_states = []
+        all_actions = []
+        all_log_probs = []
+        all_rewards = []
+        all_dones = []
+        all_values = []
+        all_advantages = []
+        all_returns = []
+
         for r in results:
             self.episode_returns.extend(r['episode_returns'])
             self.episode_lengths.extend(r['episode_lengths'])
             self.episode_successes.extend(r['episode_successes'])
-        
-        advantages, returns = compute_gae(
-            result['rewards'], result['values'], result['dones'],
-            self.args.gamma, self.args.gae_lambda
-        )
+
+            if len(r['states']) == 0:
+                continue
+
+            if not r['dones'][-1]:
+                with torch.no_grad():
+                    final_state_t = torch.FloatTensor(r['states'][-1]).unsqueeze(0).to(self.device)
+                    _, next_value = self.policy(final_state_t)
+                    next_value = next_value.item()
+            else:
+                next_value = r['values'][-1] if r['timeouts'][-1] else 0.0
+
+            advantages, returns = compute_gae_with_timeouts(
+                r['rewards'], r['values'], r['dones'], r['timeouts'], next_value,
+                self.args.gamma, self.args.gae_lambda
+            )
+
+            all_states.append(r['states'])
+            all_actions.append(r['actions'])
+            all_log_probs.append(r['log_probs'])
+            all_rewards.append(r['rewards'])
+            all_dones.append(r['dones'])
+            all_values.append(r['values'])
+            all_advantages.append(advantages)
+            all_returns.append(returns)
+
+        if not all_states:
+            raise RuntimeError("No rollout data collected from workers")
+
+        states = np.concatenate(all_states)
+        actions = np.concatenate(all_actions)
+        log_probs = np.concatenate(all_log_probs)
+        rewards = np.concatenate(all_rewards)
+        dones = np.concatenate(all_dones)
+        values = np.concatenate(all_values)
+        advantages = np.concatenate(all_advantages)
+        returns = np.concatenate(all_returns)
         
         from dataclasses import dataclass
         
@@ -352,8 +482,8 @@ class AdaptivePPOTrainer:
             returns: np.ndarray
         
         return RolloutBatch(
-            result['states'], result['actions'], result['log_probs'],
-            result['rewards'], result['dones'], result['values'],
+            states, actions, log_probs,
+            rewards, dones, values,
             advantages, returns
         )
     
@@ -412,22 +542,25 @@ class AdaptivePPOTrainer:
         print("🚀 Starting ADAPTIVE PPO training...\n")
         start_time = time.time()
         
-        num_updates = self.args.total_timesteps // self.args.rollout_steps
+        steps_per_update = self.args.rollout_steps * self.args.num_workers
+        num_updates = max(1, self.args.total_timesteps // steps_per_update)
         
         for update in range(num_updates):
             batch = self.collect_rollout(env_config, self.args.rollout_steps)
             self.update(batch)
             
-            # ADAPTIVE ENTROPY DECAY
-            self.current_ent_coef = max(
-                self.args.ent_coef_end,
-                self.current_ent_coef * self.args.ent_coef_decay
+            # ADAPTIVE ENTROPY DECAY (global step based)
+            self.total_timesteps += steps_per_update
+            progress = min(1.0, self.total_timesteps / max(1, self.args.total_timesteps))
+            self.current_ent_coef = (
+                self.args.ent_coef_start +
+                progress * (self.args.ent_coef_end - self.args.ent_coef_start)
             )
             
             # Check for improvement
             current_success = np.mean(self.episode_successes) if self.episode_successes else 0
             
-            if current_success > self.best_success_rate:
+            if current_success >= self.best_success_rate and current_success > 0:
                 self.best_success_rate = current_success
                 self.best_policy_state = {k: v.cpu().clone() for k, v in self.policy.state_dict().items()}
                 self.updates_since_improvement = 0
@@ -499,6 +632,16 @@ class AdaptivePPOTrainer:
 # MAIN
 # ============================================================================
 
+def suppress_qt_warnings(render_enabled: bool):
+    os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false"
+    os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+
+    if render_enabled:
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+        os.environ["XDG_SESSION_TYPE"] = "x11"
+
+    sys.stderr = _QtStderrFilter(sys.stderr)
+
 def main():
     parser = argparse.ArgumentParser()
     
@@ -533,10 +676,12 @@ def main():
     
     # REWARDS
     parser.add_argument("--success_bonus", type=float, default=250000)
+    parser.add_argument("--success_reward_threshold", type=float, default=2000)
     parser.add_argument("--curiosity_bonus", type=float, default=5)
     parser.add_argument("--progress_bonus", type=float, default=100)
     parser.add_argument("--ir_bonus", type=float, default=50)
     parser.add_argument("--attachment_bonus", type=float, default=1000)
+    parser.add_argument("--attachment_reward_threshold", type=float, default=100)
     parser.add_argument("--stagnation_penalty", type=float, default=10)
     parser.add_argument("--loop_penalty", type=float, default=50)
     
@@ -545,8 +690,11 @@ def main():
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=100)
+    parser.add_argument("--render", action="store_true", help="Show live visualization window (worker 0 only)")
     
     args = parser.parse_args()
+
+    suppress_qt_warnings(args.render)
     
     device = torch.device(args.device)
     if device.type == "cpu":

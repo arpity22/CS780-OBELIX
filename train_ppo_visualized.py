@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """
-CORRECTED ADAPTIVE PPO - All 10 Critical Issues Fixed
+PPO with Visualization (DDQN-style) + Corrected Reward Scaling
 
-FIXES:
-1. ✅ Use ALL worker data (not just results[0])
-2. ✅ Remove probability hacking (use rewards only)
-3. ✅ Reward scaling (divide by 1000)
-4. ✅ Proper GAE bootstrap (use critic for mid-episode)
-5. ✅ Distinguish timeout from true termination
-6. ✅ Restore optimizer state with policy
-7. ✅ Remove sensor-count progress bonus
-8. ✅ Remove state-hashing curiosity
-9. ✅ Fix entropy decay schedule (per timestep)
-10. ✅ Fix success condition (reward >= 2000)
+KEY FIX: Reward scaling applied SELECTIVELY:
+- Success bonus: NOT scaled (keep massive)
+- Environment penalties: Scaled (for stability)
+- Result: Success becomes overwhelmingly important again
 """
 
 import os
@@ -33,23 +26,147 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
+# Visualization imports
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
+
 ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
 
 # ============================================================================
-# WORKER (FIXED)
+# METRICS TRACKER (like DDQN)
+# ============================================================================
+
+class MetricsTracker:
+    """Track and plot training metrics."""
+    
+    def __init__(self, save_dir):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(exist_ok=True)
+        
+        # Metrics storage
+        self.episodes = []
+        self.returns = []
+        self.lengths = []
+        self.successes = []
+        self.avg_returns = []
+        self.success_rates = []
+        
+        # Per-update metrics
+        self.updates = []
+        self.policy_losses = []
+        self.value_losses = []
+        self.entropies = []
+        self.entropy_coefs = []
+    
+    def add_episode(self, episode, return_val, length, success):
+        """Add single episode metrics."""
+        self.episodes.append(episode)
+        self.returns.append(return_val)
+        self.lengths.append(length)
+        self.successes.append(1 if success else 0)
+    
+    def add_update(self, update, policy_loss, value_loss, entropy, ent_coef, avg_return, success_rate):
+        """Add update-level metrics."""
+        self.updates.append(update)
+        self.policy_losses.append(policy_loss)
+        self.value_losses.append(value_loss)
+        self.entropies.append(entropy)
+        self.entropy_coefs.append(ent_coef)
+        self.avg_returns.append(avg_return)
+        self.success_rates.append(success_rate)
+    
+    def plot(self):
+        """Generate and save plots."""
+        if len(self.updates) < 2:
+            return
+        
+        fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+        fig.suptitle('PPO Training Metrics', fontsize=16)
+        
+        # 1. Success Rate
+        ax = axes[0, 0]
+        ax.plot(self.updates, [s*100 for s in self.success_rates], 'g-', linewidth=2)
+        ax.set_xlabel('Update')
+        ax.set_ylabel('Success Rate (%)')
+        ax.set_title('Success Rate Over Training')
+        ax.grid(True, alpha=0.3)
+        ax.axhline(y=95, color='r', linestyle='--', label='Efficiency Threshold')
+        ax.legend()
+        
+        # 2. Average Return
+        ax = axes[0, 1]
+        ax.plot(self.updates, self.avg_returns, 'b-', linewidth=2)
+        ax.set_xlabel('Update')
+        ax.set_ylabel('Average Return')
+        ax.set_title('Average Episode Return')
+        ax.grid(True, alpha=0.3)
+        
+        # 3. Episode Length
+        ax = axes[1, 0]
+        if len(self.episodes) > 0:
+            # Rolling average
+            window = 50
+            if len(self.lengths) >= window:
+                rolling_lengths = np.convolve(self.lengths, np.ones(window)/window, mode='valid')
+                rolling_episodes = self.episodes[window-1:]
+                ax.plot(rolling_episodes, rolling_lengths, 'purple', linewidth=2, label=f'{window}-ep avg')
+            ax.plot(self.episodes, self.lengths, 'purple', alpha=0.3, label='Raw')
+            ax.set_xlabel('Episode')
+            ax.set_ylabel('Steps')
+            ax.set_title('Episode Length')
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+        
+        # 4. Policy Loss
+        ax = axes[1, 1]
+        ax.plot(self.updates, self.policy_losses, 'orange', linewidth=2)
+        ax.set_xlabel('Update')
+        ax.set_ylabel('Policy Loss')
+        ax.set_title('Policy Loss')
+        ax.grid(True, alpha=0.3)
+        
+        # 5. Value Loss
+        ax = axes[2, 0]
+        ax.plot(self.updates, self.value_losses, 'red', linewidth=2)
+        ax.set_xlabel('Update')
+        ax.set_ylabel('Value Loss')
+        ax.set_title('Value Loss (Critic)')
+        ax.grid(True, alpha=0.3)
+        
+        # 6. Entropy & Coefficient
+        ax = axes[2, 1]
+        ax2 = ax.twinx()
+        ax.plot(self.updates, self.entropies, 'cyan', linewidth=2, label='Entropy')
+        ax2.plot(self.updates, self.entropy_coefs, 'magenta', linewidth=2, label='Ent Coef')
+        ax.set_xlabel('Update')
+        ax.set_ylabel('Entropy', color='cyan')
+        ax2.set_ylabel('Entropy Coefficient', color='magenta')
+        ax.set_title('Exploration Metrics')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+        
+        plt.tight_layout()
+        plot_path = self.save_dir / 'training_metrics.png'
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"📊 Plots saved to {plot_path}")
+
+# ============================================================================
+# WORKER (CORRECTED REWARD SCALING)
 # ============================================================================
 
 def parallel_rollout_worker(args_tuple):
     """
-    Fixed worker:
-    - No probability hacking (removed)
-    - No curiosity hashing (removed)
-    - No sensor-count progress (removed)
-    - Reward scaling (divide by 1000)
-    - Proper timeout detection
+    FIXED: Selective reward scaling.
+    - Success bonus: Keep massive (not scaled)
+    - Env penalties: Scale down (for stability)
+    - Rendering: Only worker 0 shows visualization
     """
     (obelix_path, env_config, policy_state, num_steps, seed, 
-     config, hidden_dim) = args_tuple
+     config, hidden_dim, worker_id, render_enabled) = args_tuple
     
     import importlib.util
     spec = importlib.util.spec_from_file_location("obelix_env", obelix_path)
@@ -70,7 +187,7 @@ def parallel_rollout_worker(args_tuple):
                 nn.Linear(in_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),  # FIX: hidden_dim, not in_dim
                 nn.LayerNorm(hidden_dim),
                 nn.ReLU(inplace=True),
             )
@@ -99,13 +216,11 @@ def parallel_rollout_worker(args_tuple):
     state = env.reset(seed=seed)
     
     states, actions, log_probs, rewards, dones, values = [], [], [], [], [], []
-    timeouts = []  # FIX 5: Track timeouts separately
+    timeouts = []
     episode_returns, episode_lengths, episode_successes = [], [], []
     
     episode_reward = 0
     episode_length = 0
-    
-    # FIX 2: No probability modification - just track actions for penalty
     action_memory = deque(maxlen=8)
     
     for step in range(num_steps):
@@ -114,8 +229,6 @@ def parallel_rollout_worker(args_tuple):
         with torch.no_grad():
             logits, value = policy(state_t)
             probs = F.softmax(logits, dim=-1)
-            
-            # FIX 2: NO probability hacking - sample from true policy
             dist = Categorical(probs)
             action_idx = dist.sample()
             log_prob = dist.log_prob(action_idx)
@@ -124,60 +237,52 @@ def parallel_rollout_worker(args_tuple):
         log_prob = log_prob.item()
         value = value.item()
         
-        next_state, reward, done = env.step(ACTIONS[action_idx], render=False)
-        
-        # Check if timeout (FIX 5)
+        next_state, reward, done = env.step(ACTIONS[action_idx], render=(render_enabled and worker_id == 0))
         is_timeout = (episode_length + 1 >= env_config['max_steps']) and done
         
         # REWARD SHAPING
-        shaped_reward = reward
+        # Start with scaled base reward
+        base_scaled = reward / 1000.0  # Scale env rewards (-200, +5, etc.)
+        shaped_reward = base_scaled
         
-        # FIX 1: MASSIVE SUCCESS BONUS (kept, but will be scaled)
-        if done and reward >= 50:  # FIX 10: Proper success detection
-            shaped_reward += config['success_bonus']
+        # Add shaped bonuses
+        # CRITICAL: Success bonus scaled separately (less aggressive)
+        if done and reward >= 2000:
+            # Success: add massive bonus (scaled lightly)
+            shaped_reward += config['success_bonus'] / 100.0  # 250k -> 2500
         
-        # FIX 7: REMOVED sensor-count progress bonus
-        # (Rely on env's built-in +1/+2/+5 rewards)
-        
-        # IR bonus
+        # Other bonuses (already small, scale normally)
         if next_state[16] == 1:
-            shaped_reward += config['ir_bonus']
-        
-        # Attachment bonus
+            shaped_reward += config['ir_bonus'] / 1000.0
         if next_state[17] == 1:
-            shaped_reward += config['attachment_bonus']
+            shaped_reward += config['attachment_bonus'] / 1000.0
         
-        # FIX 2: Loop penalty via REWARD (not probability hacking)
-        if len(action_memory) >= 8:
-            unique_actions = len(set(action_memory))
-            if unique_actions <= 2:  # Very repetitive
-                shaped_reward -= config['loop_penalty']
+        # Loop penalty
+        if len(action_memory) >= 8 and len(set(action_memory)) <= 2:
+            shaped_reward -= config['loop_penalty'] / 1000.0
         
         action_memory.append(action_idx)
         
-        # FIX 3: REWARD SCALING - divide by 1000 for stable critic training
-        scaled_reward = shaped_reward / 1000.0
+        # Use shaped_reward directly (already scaled)
+        scaled_reward = shaped_reward
         
-        # Store
         states.append(state.copy())
         actions.append(action_idx)
         log_probs.append(log_prob)
-        rewards.append(scaled_reward)  # FIX 3: Scaled reward
+        rewards.append(scaled_reward)
         dones.append(done)
-        timeouts.append(is_timeout)  # FIX 5: Track timeouts
+        timeouts.append(is_timeout)
         values.append(value)
         
-        episode_reward += reward  # Track UNSCALED for metrics
+        episode_reward += reward
         episode_length += 1
         state = next_state
         
         if done:
-            # FIX 10: Proper success detection (>= 2000, not > 0)
             episode_successes.append(reward >= 2000)
             episode_returns.append(episode_reward)
             episode_lengths.append(episode_length)
             
-            # Reset
             state = env.reset(seed=seed + len(episode_returns))
             episode_reward = 0
             episode_length = 0
@@ -189,7 +294,7 @@ def parallel_rollout_worker(args_tuple):
         'log_probs': np.array(log_probs),
         'rewards': np.array(rewards),
         'dones': np.array(dones),
-        'timeouts': np.array(timeouts),  # FIX 5
+        'timeouts': np.array(timeouts),
         'values': np.array(values),
         'episode_returns': episode_returns,
         'episode_lengths': episode_lengths,
@@ -197,7 +302,7 @@ def parallel_rollout_worker(args_tuple):
     }
 
 # ============================================================================
-# UTILS (FIXED)
+# UTILS
 # ============================================================================
 
 def import_obelix(path: str):
@@ -206,32 +311,19 @@ def import_obelix(path: str):
     spec.loader.exec_module(mod)
     return mod.OBELIX
 
-def compute_gae_fixed(rewards, values, dones, timeouts, next_value, gamma=0.99, gae_lambda=0.95):
-    """
-    FIX 4 & 5: Proper GAE with bootstrap and timeout handling.
-    
-    Args:
-        next_value: The critic's value estimate for the state AFTER the last step
-        timeouts: Boolean array indicating which dones are timeouts (not true terminals)
-    """
+def compute_gae(rewards, values, dones, timeouts, next_value, gamma=0.99, gae_lambda=0.95):
     advantages = np.zeros_like(rewards)
     last_gae = 0
     
     for t in reversed(range(len(rewards))):
         if t == len(rewards) - 1:
-            # FIX 4: Use provided next_value instead of 0
             next_value_t = next_value
         else:
             next_value_t = values[t + 1]
         
-        # FIX 5: If timeout, bootstrap. If true done, use 0.
         if dones[t]:
-            if timeouts[t]:
-                # Timeout: bootstrap from next state
-                mask = 1.0
-            else:
-                # True termination: no future value
-                mask = 0.0
+            mask = 1.0 if timeouts[t] else 0.0
+            if not timeouts[t]:
                 next_value_t = 0.0
         else:
             mask = 1.0
@@ -281,10 +373,10 @@ class ActorCritic(nn.Module):
         return logits, value
 
 # ============================================================================
-# TRAINER (FIXED)
+# TRAINER
 # ============================================================================
 
-class FixedAdaptivePPOTrainer:
+class VisualizedPPOTrainer:
     def __init__(self, args, device):
         self.args = args
         self.device = device
@@ -292,7 +384,6 @@ class FixedAdaptivePPOTrainer:
         self.policy = ActorCritic(18, 5, args.hidden_dim).to(device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=args.lr, eps=1e-5)
         
-        # LR scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='max', factor=0.5, patience=50
         )
@@ -305,24 +396,22 @@ class FixedAdaptivePPOTrainer:
         self.value_losses = []
         self.entropies = []
         
-        # FIX 6: Save optimizer state too
         self.best_success_rate = 0.0
         self.best_policy_state = None
-        self.best_optimizer_state = None  # FIX 6: Added
+        self.best_optimizer_state = None
         self.updates_since_improvement = 0
         
-        # FIX 9: Entropy decay per timestep (not per update)
         self.total_timesteps = 0
         self.current_ent_coef = args.ent_coef_start
+        self.optimization_stage = 1
         
-        # Track which optimization stage we're in
-        self.optimization_stage = 1  # 1 = success rate, 2 = efficiency
+        # Metrics tracker
+        self.metrics = MetricsTracker(f"submission_{args.agent_id}")
+        
+        # Episode counter for visualization
+        self.total_episodes = 0
     
     def collect_rollout(self, env_config, num_steps):
-        """
-        FIX 1: Collect from ALL workers and concatenate.
-        FIX 4: Bootstrap final value properly.
-        """
         policy_state = {k: v.cpu() for k, v in self.policy.state_dict().items()}
         
         config = {
@@ -337,13 +426,15 @@ class FixedAdaptivePPOTrainer:
             seed = self.args.seed + i * 1000
             worker_args.append((
                 self.args.obelix_py, env_config, policy_state,
-                num_steps, seed, config, self.args.hidden_dim
+                num_steps, seed, config, self.args.hidden_dim,
+                i,  # worker_id
+                self.args.render  # render_enabled flag
             ))
         
         with Pool(processes=self.args.num_workers) as pool:
             results = pool.map(parallel_rollout_worker, worker_args)
         
-        # FIX 1: CONCATENATE ALL WORKER DATA (not just results[0])
+        # Concatenate ALL worker data
         all_states = np.concatenate([r['states'] for r in results])
         all_actions = np.concatenate([r['actions'] for r in results])
         all_log_probs = np.concatenate([r['log_probs'] for r in results])
@@ -352,33 +443,27 @@ class FixedAdaptivePPOTrainer:
         all_timeouts = np.concatenate([r['timeouts'] for r in results])
         all_values = np.concatenate([r['values'] for r in results])
         
-        # Track episode metrics from all workers
+        # Track episodes
         for r in results:
             self.episode_returns.extend(r['episode_returns'])
             self.episode_lengths.extend(r['episode_lengths'])
             self.episode_successes.extend(r['episode_successes'])
+            
+            # Add to visualization
+            for ret, length, success in zip(r['episode_returns'], r['episode_lengths'], r['episode_successes']):
+                self.metrics.add_episode(self.total_episodes, ret, length, success)
+                self.total_episodes += 1
         
-        # FIX 4: Get bootstrap value for final state
-        # Check if last step is mid-episode
+        # Bootstrap
         if not all_dones[-1]:
-            # Mid-episode: need to bootstrap
-            final_state = all_states[-1]
             with torch.no_grad():
-                final_state_t = torch.FloatTensor(final_state).unsqueeze(0).to(self.device)
+                final_state_t = torch.FloatTensor(all_states[-1]).unsqueeze(0).to(self.device)
                 _, next_value = self.policy(final_state_t)
                 next_value = next_value.item()
         else:
-            # Episode ended naturally
-            if all_timeouts[-1]:
-                # Timeout: should bootstrap but we don't have next state
-                # Approximate with final value
-                next_value = all_values[-1]
-            else:
-                # True terminal: value = 0
-                next_value = 0.0
+            next_value = all_values[-1] if all_timeouts[-1] else 0.0
         
-        # FIX 4 & 5: Compute GAE with proper bootstrap
-        advantages, returns = compute_gae_fixed(
+        advantages, returns = compute_gae(
             all_rewards, all_values, all_dones, all_timeouts, next_value,
             self.args.gamma, self.args.gae_lambda
         )
@@ -431,8 +516,6 @@ class FixedAdaptivePPOTrainer:
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
                 value_loss = F.mse_loss(values.squeeze(), returns_t[idx])
-                
-                # Use current adaptive entropy coefficient
                 loss = policy_loss + self.args.vf_coef * value_loss - self.current_ent_coef * entropy
                 
                 self.optimizer.zero_grad()
@@ -454,7 +537,7 @@ class FixedAdaptivePPOTrainer:
             'box_speed': self.args.box_speed,
         }
         
-        print("🚀 Starting FIXED ADAPTIVE PPO training...\n")
+        print("🚀 Starting PPO with Visualization...\n")
         start_time = time.time()
         
         num_updates = self.args.total_timesteps // (self.args.rollout_steps * self.args.num_workers)
@@ -463,142 +546,81 @@ class FixedAdaptivePPOTrainer:
             batch = self.collect_rollout(env_config, self.args.rollout_steps)
             self.update(batch)
             
-            # FIX 9: Entropy decay per TIMESTEP (not per update)
+            # Entropy decay
             self.total_timesteps += self.args.rollout_steps * self.args.num_workers
             progress = self.total_timesteps / self.args.total_timesteps
             self.current_ent_coef = self.args.ent_coef_start + progress * (self.args.ent_coef_end - self.args.ent_coef_start)
-            self.current_ent_coef = max(self.args.ent_coef_end, self.current_ent_coef)
             
-            # Check for improvement
             current_success = np.mean(self.episode_successes) if self.episode_successes else 0
             current_return = np.mean(self.episode_returns) if self.episode_returns else -999999
             
-            # ADAPTIVE METRIC: Switch optimization target based on success rate
-            if current_success >= 0.95:
-                # Stage 2: High success - optimize for EFFICIENCY (maximize return)
-                if self.optimization_stage == 1:
-                    print(f"\n{'='*70}")
-                    print(f"🎉 SUCCESS RATE ≥95%! Switching to EFFICIENCY optimization")
-                    print(f"   Now optimizing: Episode Return (minimize steps/penalties)")
-                    print(f"   Safety: Will revert if success drops below 85%")
-                    print(f"{'='*70}\n")
-                    self.optimization_stage = 2
-                    # Reset best metric when switching stages
-                    self.best_success_rate = current_return
-                
-                # SAFETY CHECK: Don't accept efficiency improvements that hurt success too much
-                if current_success < 0.85:
-                    # Success dropped too low - reject this as improvement
-                    print(f"⚠️  Success dropped to {current_success*100:.1f}% - prioritizing success over efficiency")
-                    improvement = False
-                    # Switch back to success optimization if consistently low
-                    if current_success < 0.80:
-                        print(f"⚠️  Success < 80%! Reverting to SUCCESS optimization")
-                        self.optimization_stage = 1
-                        self.best_success_rate = 0.0  # Reset to start fresh
-                        improvement = False
-                else:
-                    # Success is still high - can optimize for efficiency
-                    optimization_metric = current_return
-                    metric_name = "Return"
-                    metric_value = current_return
-                    
-                    # At high success, compare returns (higher is better)
-                    if optimization_metric > self.best_success_rate:  # Reusing variable name
-                        improvement = True
-                    else:
-                        improvement = False
-            else:
-                # Stage 1: Low success - optimize for SUCCESS RATE
-                optimization_metric = current_success
-                metric_name = "Success"
-                metric_value = current_success * 100
-                
-                # Compare success rates (higher is better)
-                if optimization_metric > self.best_success_rate:
-                    improvement = True
-                else:
-                    improvement = False
-            
-            if improvement:
-                self.best_success_rate = optimization_metric  # Store best metric
-                # FIX 6: Save BOTH policy and optimizer state
+            # Check improvement
+            if current_success > self.best_success_rate:
+                self.best_success_rate = current_success
                 self.best_policy_state = copy.deepcopy({k: v.cpu() for k, v in self.policy.state_dict().items()})
                 self.best_optimizer_state = copy.deepcopy(self.optimizer.state_dict())
                 self.updates_since_improvement = 0
-                print(f"🎯 NEW BEST {metric_name.upper()}! {metric_name}: {metric_value:.1f} | Success: {current_success*100:.1f}%")
+                print(f"🎯 NEW BEST! Success: {current_success*100:.1f}%")
             else:
                 self.updates_since_improvement += 1
             
-            # Anti-forgetting: Restore if stuck OR if success floor violated in efficiency mode
-            should_restore = False
-            restore_reason = ""
-            
-            if self.best_policy_state is not None:
-                # Immediate restore if success drops too low during efficiency mode
-                if self.optimization_stage == 2 and current_success < 0.85:
-                    should_restore = True
-                    restore_reason = f"success dropped to {current_success*100:.1f}% (floor: 85%)"
-                # Regular restore if stuck for 100 updates
-                elif self.updates_since_improvement > 100:
-                    should_restore = True
-                    restore_reason = "stuck for 100 updates"
-            
-            if should_restore:
-                print(f"⚠️  RESTORING BEST POLICY ({restore_reason})")
-                # FIX 6: Restore BOTH policy and optimizer
+            # Anti-forgetting
+            if self.updates_since_improvement > 100 and self.best_policy_state is not None:
+                print(f"⚠️  RESTORING BEST POLICY")
                 self.policy.load_state_dict({k: v.to(self.device) for k, v in self.best_policy_state.items()})
                 self.optimizer.load_state_dict(self.best_optimizer_state)
                 self.updates_since_improvement = 0
-                # Reset entropy to encourage exploration
                 self.current_ent_coef = self.args.ent_coef_start
             
-            # LR scheduling
             self.scheduler.step(current_success)
+            
+            # Add metrics for visualization
+            if len(self.policy_losses) > 0:
+                self.metrics.add_update(
+                    update + 1,
+                    np.mean(self.policy_losses[-100:]),
+                    np.mean(self.value_losses[-100:]),
+                    np.mean(self.entropies[-100:]),
+                    self.current_ent_coef,
+                    current_return,
+                    current_success
+                )
             
             if (update + 1) % self.args.log_interval == 0:
                 elapsed = time.time() - start_time
-                mean_return = np.mean(self.episode_returns) if self.episode_returns else 0
+                mean_return = current_return
                 std_return = np.std(self.episode_returns) if self.episode_returns else 0
                 mean_length = np.mean(self.episode_lengths) if self.episode_lengths else 0
                 
-                stage_marker = "📈" if self.optimization_stage == 1 else "⚡"
-                stage_name = "Success" if self.optimization_stage == 1 else "Efficiency"
-                
-                print(f"{stage_marker} Update {update+1:4d}/{num_updates} [{stage_name}] | "
+                print(f"Update {update+1:4d}/{num_updates} | "
                       f"Return: {mean_return:8.1f} ± {std_return:6.1f} | "
                       f"Length: {mean_length:5.1f} | "
                       f"Success: {current_success*100:5.1f}% | "
-                      f"Entropy: {np.mean(self.entropies[-100:]) if self.entropies else 0:5.3f} | "
-                      f"EntCoef: {self.current_ent_coef:.4f} | "
-                      f"Steps: {self.total_timesteps:,} | "
+                      f"Entropy: {np.mean(self.entropies[-100:]):5.3f} | "
                       f"Time: {elapsed/60:.1f}m")
+            
+            # Plot every 20 updates
+            if (update + 1) % 20 == 0:
+                self.metrics.plot()
             
             if (update + 1) % self.args.save_interval == 0:
                 self.save_checkpoint(update + 1)
         
         self.save_checkpoint(num_updates, final=True)
+        self.metrics.plot()  # Final plot
         
         print(f"\n{'='*70}")
         print(f"✅ Training Complete!")
-        print(f"{'='*70}")
-        print(f"Time: {(time.time() - start_time)/60:.1f} minutes")
-        print(f"Best Success Rate: {self.best_success_rate*100:.1f}%")
-        print(f"Final Success Rate: {current_success*100:.1f}%")
+        print(f"Best Success: {self.best_success_rate*100:.1f}%")
     
     def save_checkpoint(self, update, final=False):
         submission_dir = Path(f"submission_{self.args.agent_id}")
         submission_dir.mkdir(exist_ok=True)
         
         if final:
-            # Save best policy
             if self.best_policy_state is not None:
                 torch.save(self.best_policy_state, submission_dir / "weights.pth")
                 print(f"✓ BEST model saved (Success: {self.best_success_rate*100:.1f}%)")
-            else:
-                torch.save({k: v.cpu() for k, v in self.policy.state_dict().items()}, 
-                          submission_dir / "weights.pth")
-                print(f"✓ Final model saved")
         else:
             checkpoint = {
                 'policy_state_dict': {k: v.cpu() for k, v in self.policy.state_dict().items()},
@@ -607,8 +629,6 @@ class FixedAdaptivePPOTrainer:
                 'best_optimizer_state_dict': self.best_optimizer_state,
                 'update': update,
                 'best_success_rate': self.best_success_rate,
-                'current_ent_coef': self.current_ent_coef,
-                'total_timesteps': self.total_timesteps,
             }
             torch.save(checkpoint, submission_dir / f"checkpoint_update{update}.pth")
 
@@ -617,11 +637,11 @@ class FixedAdaptivePPOTrainer:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='FIXED ADAPTIVE PPO')
+    parser = argparse.ArgumentParser()
     
     # Environment
     parser.add_argument("--obelix_py", type=str, required=True)
-    parser.add_argument("--agent_id", type=str, default="ppo_fixed")
+    parser.add_argument("--agent_id", type=str, default="ppo_viz")
     parser.add_argument("--difficulty", type=int, default=0)
     parser.add_argument("--wall_obstacles", action="store_true")
     parser.add_argument("--box_speed", type=int, default=2)
@@ -647,9 +667,8 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=0.5)
     parser.add_argument("--hidden_dim", type=int, default=128)
     
-    # REWARDS (FIX 3: These are before scaling)
-    parser.add_argument("--success_bonus", type=float, default=250000, 
-                       help="Success bonus BEFORE scaling (will be divided by 1000)")
+    # REWARDS (NO SCALING on success!)
+    parser.add_argument("--success_bonus", type=float, default=250000)
     parser.add_argument("--ir_bonus", type=float, default=50)
     parser.add_argument("--attachment_bonus", type=float, default=1000)
     parser.add_argument("--loop_penalty", type=float, default=100)
@@ -659,6 +678,7 @@ def main():
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=100)
+    parser.add_argument("--render", action="store_true", help="Show live visualization window (worker 0 only)")
     
     args = parser.parse_args()
     
@@ -671,30 +691,29 @@ def main():
     torch.manual_seed(args.seed)
     
     print(f"\n{'='*70}")
-    print(f"FIXED ADAPTIVE PPO - All 10 Critical Issues Resolved")
+    print(f"PPO with Visualization + Complete Reward Scaling")
     print(f"{'='*70}")
     print(f"Agent ID: {args.agent_id}")
-    print(f"Total Timesteps: {args.total_timesteps:,}")
     print(f"Workers: {args.num_workers}")
-    print(f"\n✅ FIXES APPLIED:")
-    print(f"  1. Using ALL {args.num_workers} workers' data (not just 1)")
-    print(f"  2. No probability hacking (pure PPO)")
-    print(f"  3. Reward scaling (/1000 for stable critic)")
-    print(f"  4. Proper GAE bootstrap (no mid-episode cutoff)")
-    print(f"  5. Timeout vs termination distinction")
-    print(f"  6. Optimizer state saved/restored with policy")
-    print(f"  7. Removed sensor-count progress (use env rewards)")
-    print(f"  8. Removed state-hashing curiosity (POMDP aliasing)")
-    print(f"  9. Entropy decay per timestep (not per update)")
-    print(f"  10. Success detection: reward >= 2000 (not > 0)")
-    print(f"\n📊 REWARDS (before /1000 scaling):")
-    print(f"  Success: +{args.success_bonus:,}")
-    print(f"  IR: +{args.ir_bonus}")
-    print(f"  Attachment: +{args.attachment_bonus}")
-    print(f"  Loop: -{args.loop_penalty}")
+    if args.render:
+        print(f"🎮 Live Pygame Window: ENABLED (worker 0 only)")
+        print(f"   ⚠️  Training will be slower with rendering")
+    else:
+        print(f"🎮 Live Pygame Window: DISABLED (use --render to enable)")
+    print(f"\n🔧 REWARD SCALING STRATEGY:")
+    print(f"  Base env rewards: /1000 (-0.2 wall, +0.005 sensor, +2.0 success)")
+    print(f"  Success bonus: {args.success_bonus:,} /100 = {args.success_bonus/100:,.0f}")
+    print(f"  IR bonus: {args.ir_bonus} /1000 = {args.ir_bonus/1000:.3f}")
+    print(f"  Attachment: {args.attachment_bonus} /1000 = {args.attachment_bonus/1000:.1f}")
+    print(f"  Loop penalty: {args.loop_penalty} /1000 = {args.loop_penalty/1000:.1f}")
+    print(f"\n💡 RESULT:")
+    print(f"  Success episode: ~+{2 + args.success_bonus/100:,.0f}")
+    print(f"  Failed episode: ~-{200*1500/1000:.0f}")
+    print(f"  Ratio: {(2 + args.success_bonus/100) / (200*1500/1000):.1f}x (SUCCESS DOMINATES!)")
+    print(f"\n📊 Plots will be saved to: submission_{args.agent_id}/")
     print(f"{'='*70}\n")
     
-    trainer = FixedAdaptivePPOTrainer(args, device)
+    trainer = VisualizedPPOTrainer(args, device)
     trainer.train()
 
 if __name__ == "__main__":
