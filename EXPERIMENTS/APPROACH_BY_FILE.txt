@@ -1,0 +1,273 @@
+OBELIX (CS780) — Approach by file (algorithms, improvements, non‑conventional innovations)
+
+Context / shared assumptions
+- Observation is a length-18 vector: 16 sonar bits + IR bit + attached/stuck bit (varies by script naming).
+- Action space is fixed: ["L45", "L22", "FW", "R22", "R45"].
+- Many “innovations” here are pragmatic competition tricks: shaping, deterministic eval, action smoothing, and
+  adding internal memory/state because the evaluator does not provide episode boundaries to policy().
+
+================================================================================
+AGENTS (evaluation/inference files)
+================================================================================
+
+agent_template.py
+- Base approach: hand-coded heuristic (sensor-following).
+- Improvements: forward bias + turning toward sonar “center-of-mass”; deterministic simple logic.
+- Non‑conventional innovation: explicitly embraces “no training” as a strong baseline that can outperform
+  unstable RL in sparse-reward settings.
+
+agent.py
+- Base approach: plain feed-forward DQN (MLP) inference (greedy argmax).
+- Improvements: strict deterministic evaluation (model.eval(), no epsilon) to reduce score variance.
+- Non‑conventional innovation: action smoothing / anti-oscillation when top-2 Q values are close.
+
+agent_d3qn_per.py
+- Base approach: dueling DQN inference (Q(s,a)=V(s)+A(s,a)-mean(A)).
+- Improvements: LayerNorm matches the training architecture; greedy action selection.
+- Non‑conventional innovation: stronger action smoothing (repeat previous action up to a limit when Q-gap is small)
+  to stabilize evaluation trajectories.
+
+agent_gemini.py
+- Base approach: dueling DQN inference compatible with train_d3qn_per_gemini.py checkpoints.
+- Improvements: supports multiple checkpoint formats (raw state_dict vs {state_dict: ...}).
+- Non‑conventional innovation: lightweight evaluation-time action smoothing.
+
+agent_ppo.py
+- Base approach: PPO actor-critic policy inference.
+- Improvements: deterministic argmax action for competition evaluation; loads weights lazily.
+- Non‑conventional innovation: ships both deterministic and stochastic policy variants for debugging/ablation.
+
+agent_adrqn.py
+- Base approach: ADRQN (Action-specific Deep Recurrent Q-Network) for POMDP.
+- Improvements: augments obs with last-action one-hot + “time since seen” feature; LSTM maintains memory.
+- Non‑conventional innovation: episode-reset heuristics inside policy() (because evaluator doesn’t pass done).
+
+agent_rd3qn.py
+- Base approach: recurrent dueling Q-network (LSTM) with extra spatial features.
+- Improvements: a learned Q-function consumes both sensors and a handcrafted 2D belief grid.
+- Non‑conventional innovations:
+  - SpatialBeliefMap: internal map updated via action-conditioned heading + approximate forward motion.
+  - Temporal decay of map evidence + marking obstacles on stuck.
+  - “Self-calibration” placeholder to correct drift (conceptual hook for sim→real style issues).
+
+agent_raptor_ppo.py
+- Base approach: recurrent actor-critic (GRU) + augmented observation for POMDP.
+- Improvements:
+  - Obs augmentation: raw obs + delta(obs) + last-action one-hot + (steps-since-seen, progress).
+  - Deterministic evaluation with a safety override (stuck recovery + structured search).
+- Non‑conventional innovations:
+  - Robust episode reset detection via observation “jump” heuristic.
+  - Hard-coded stuck recovery cycles to avoid permanent wedging.
+
+agent_explorer_map_ppo.py
+- Base approach: recurrent actor-critic + explicit “phase” logic on top (find/push/unwedge).
+- Improvements:
+  - Maintains an internal map keyed by heading bin × action index with channels
+    (visit count, reward EMA, stuck EMA, success EMA).
+  - Uses deterministic phase-specific overrides during evaluation.
+- Non‑conventional innovations:
+  - Hybrid policy: learned logits + deterministic phase controller.
+  - Pseudo-reward computed from observable signals (new sensor bits, forward progress, stuck penalties)
+    to update the internal map online.
+
+agent_worldmodel_pomdp.py
+- Base approach: “world-model style” belief update + separate actor network.
+- Improvements: posterior filtering over hidden state from observations (GRUCell), then greedy action from actor.
+- Non‑conventional innovations:
+  - Uses the learned belief (h,z) as a compact memory for partial observability.
+  - Falls back to structured search and hard stuck recovery when sensory signal is absent.
+
+================================================================================
+TRAINERS (offline training scripts)
+================================================================================
+
+train_2.py
+- Base algorithm: simplified DDQN-like training loop with small MLP (FastDQN).
+- Improvements (speed-focused):
+  - Small network, smaller replay, smaller batch; faster epsilon decay; frequent target sync.
+  - Lower gamma to emphasize immediate shaping/returns.
+- Non‑conventional innovation: “high-speed” hyperparameter choices intentionally trade theoretical
+  convergence guarantees for rapid iteration.
+
+train_ddqn.py
+- Base algorithm: Double DQN with replay buffer.
+- Improvements: clean reference implementation with configurable epsilon schedule, target sync, warmup.
+- Non‑conventional innovation: none (this is the baseline “correct DDQN” script).
+
+train_d3qn_per.py
+- Base algorithm: Dueling Double DQN + Prioritized Experience Replay.
+- Improvements:
+  - CPU/GPU device auto-detection + CPU thread tuning + (optional) multiprocessing episode collection.
+  - Reward shaping toggles to address sparse rewards.
+  - Extensive diagnostic logging/plotting (actions, rewards, q-values, PER stats, learning dynamics).
+- Non‑conventional innovations:
+  - Treats training as an “instrumented system”: the diagnostics are as important as the agent.
+  - “Curriculum phase” labeling/checkpointing workflow (organized submissions by phase).
+
+train_d3qn_per_gemini.py
+- Base algorithm: dueling DQN + PER using a SumTree.
+- Improvements:
+  - Importance sampling weights + priority updates.
+  - Gradient clipping + periodic target sync.
+- Non‑conventional innovation: explicit CPU thread cap (“AMD stability fix”) to keep the OBELIX engine responsive
+  during training (pragmatic systems-level fix).
+
+train_ppo.py
+- Base algorithm: PPO (on-policy actor-critic).
+- Improvements:
+  - Parallel rollout collection via multiprocessing worker function (bypass GIL, higher throughput).
+  - Conditional reward shaping to fix action bias observed in value-based methods.
+  - Entropy regularization for exploration.
+- Non‑conventional innovations:
+  - CPU-optimized PPO framed as a data-collection throughput problem.
+  - “Conditional shaping” to specifically counter pathological action distributions.
+
+train_ppo_advanced.py
+- Base algorithm: PPO.
+- Improvements:
+  - Worker has short-term state/action memory for loop detection.
+  - Phased exploration via softmax temperature: explore until “box found”, then exploit.
+  - Massive success bonus to dominate shaping noise.
+- Non‑conventional innovations:
+  - Probability hacking (down-weight repeating action) when loop detected.
+  - Temperature schedule based on “steps since box found” rather than global timestep.
+
+train_ppo_adaptive.py
+- Base algorithm: PPO.
+- Improvements:
+  - Adaptive entropy logic + learning-rate decay when stuck.
+  - Intrinsic curiosity via state hashing (encourages novelty).
+  - “Success memory” to reduce forgetting.
+  - Worker stderr/Qt warning suppression to keep logs readable and reduce overhead.
+- Non‑conventional innovations:
+  - Combines multiple anti-collapse heuristics (curiosity + progressive rewards + entropy adaptation).
+  - Systems hygiene: filter noisy Qt warnings from worker processes.
+
+train_ppo_fixed.py
+- Base algorithm: PPO.
+- Improvements: this script is explicitly a bug-fix / correctness pass over earlier adaptive PPO.
+  Key fixes include:
+  - Use ALL worker data; no probability hacking; reward scaling; correct GAE bootstrapping;
+    timeout vs termination; restore optimizer; fix entropy schedule; fix success condition.
+- Non‑conventional innovation: treats “debugging PPO” as an engineering checklist with enumerated failure modes.
+
+train_ppo_improved.py
+- Base algorithm: PPO.
+- Improvements:
+  - Deeper network and optional LSTM to handle partial observability.
+  - Curriculum learning + better reward scaling + action distribution regularization.
+  - Built-in metrics tracker with plotting for training dynamics.
+- Non‑conventional innovations:
+  - Mixes architectural scaling (depth/LSTM) with curriculum and monitoring to make training “self-auditing”.
+
+train_ppo_visualized.py
+- Base algorithm: PPO.
+- Improvements:
+  - DDQN-style metric tracking + plotting.
+  - Selective reward scaling: keep terminal/success bonus large; scale only dense penalties.
+- Non‑conventional innovation: recognizes that naive uniform scaling can destroy the objective signal;
+  scales different reward components differently.
+
+train_curriculum.py
+- Base algorithm: PPO + curriculum wrapper.
+- Improvements:
+  - Automatic curriculum manager: starts with easier initial box placement (close) and increases difficulty
+    when success rate is high.
+  - Dense shaping that decays as curriculum level rises.
+- Non‑conventional innovations:
+  - Success-based progression (not purely time-based).
+  - Environment wrapper that edits initial conditions (box placement) to break sparse-reward deadlocks.
+
+train_hybrid.py
+- Base algorithm: Q-learning (value-based) with replay.
+- Improvements:
+  - Uses a heuristic policy for exploration instead of epsilon-random.
+  - Intrinsic reward for actions that outperform heuristic.
+  - Warm-starts Q-values using heuristic value estimates.
+- Non‑conventional innovations:
+  - “Heuristic-as-teacher” (imitation-ish) without fully switching to supervised learning.
+  - Learning is framed as incremental improvement over a strong baseline policy.
+
+train_adrqn.py
+- Base algorithm: ADRQN (recurrent Q-learning with action-conditioned inputs).
+- Improvements:
+  - Parallel env workers via multiprocessing Pipes.
+  - Sequence replay buffer with a “good buffer” slice (oversample rare informative sequences).
+  - Augmented state = obs + last action one-hot + time-since-seen.
+- Non‑conventional innovations:
+  - Good-buffer oversampling is a practical fix for sparse positive events (“success amnesia”).
+  - Uses reward-threshold heuristics to label “good” sequences.
+
+train_rd3qn.py
+- Base algorithm: recurrent dueling DQN (LSTM) + spatial map input.
+- Improvements:
+  - SpatialBeliefMap added as a second input stream.
+  - Parallel env workers + sequence replay + “good buffer” oversampling.
+- Non‑conventional innovations:
+  - Blends learned recurrence with a handcrafted spatial memory structure.
+  - Map includes logical constraints: obstacle marking on stuck, decay for dynamic evidence.
+
+train_explorer_map_ppo.py
+- Base algorithm: PPO with recurrence (GRU) in a multi-env setup.
+- Improvements:
+  - Augmented observation with delta + last action + time since seen + episode progress.
+  - Explicit phase machine (find/push/unwedge) and deterministic overrides during data collection.
+  - Intrinsic shaping via a heading-binned action map (visit/reward/stuck/success EMAs).
+- Non‑conventional innovations:
+  - Learns with a hybrid controller: the policy network is not the sole decision-maker.
+  - Intrinsic reward derived from “map novelty/frontier” style terms rather than pure state-hash curiosity.
+
+train_raptor_ppo.py
+- Base algorithm: recurrent PPO + RND (Random Network Distillation) intrinsic reward.
+- Improvements:
+  - Multiprocessing env rollouts (Pipe-based workers) + on-policy updates.
+  - Obs augmentation for POMDP and dynamics prediction head.
+  - RND module adds novelty bonus; includes normalization via RunningMeanStd.
+- Non‑conventional innovations:
+  - Adds an auxiliary dynamics head (predict next observation) alongside PPO to improve representation.
+  - Evaluation is “aligned”: deterministic search + stuck recovery baked into the agent.
+
+train_worldmodel_pomdp.py
+- Base algorithm: world model (latent dynamics + posterior/prior) + actor-critic trained partially in imagination.
+- Improvements:
+  - Episode replay buffer (sequence sampling) for training the world model.
+  - Separate posterior filtering and prior transition; heads for next-obs, reward, done.
+- Non‑conventional innovations:
+  - Moves beyond model-free RL: trains a predictive model and uses it to support policy learning under POMDP.
+  - Uses “imagine” rollouts (actor/critic losses over predicted futures) rather than only real env experience.
+
+================================================================================
+UTILS / EVALUATION / SUBMISSION HELPERS
+================================================================================
+
+obelix.py
+- Base role: environment simulator + reward function.
+- Notes: contains one-time sensor-bit rewards and terminal success scoring logic.
+
+evaluate.py
+- Base role: local evaluation harness (runs agent over N seeds, logs mean/std).
+- Improvements: appends results to leaderboard.csv with full run configuration.
+
+evaluate_on_codabench.py
+- Base role: server-side (Codabench) evaluation entrypoint.
+- Improvements: robustly finds policy() in submitted zip and evaluates across multiple difficulties.
+
+export_submission_raptor.py
+- Base role: build submission.zip by copying an agent file to agent.py + selecting a weights file.
+- Improvement: deterministic “best weights” picking from common filenames.
+
+compute_observation_states.py
+- Base role: explores environment with random actions and visualizes distinct observation vectors.
+- Use: debugging observation space coverage / sparsity.
+
+manual_play.py
+- Base role: human control for qualitative debugging.
+
+================================================================================
+Quick “innovation map” (cross-cutting themes)
+================================================================================
+- POMDP handling: recurrence (LSTM/GRU) + explicit memory features (delta obs, last action, steps since seen).
+- Sparse reward handling: shaping, huge terminal bonus, good-buffer oversampling, curricula, hybrid heuristic guidance.
+- Exploration: temperature schedules, intrinsic reward (RND), novelty/frontier map features, curiosity (hashing).
+- Stability at eval time: deterministic actions + action smoothing + stuck recovery + episode reset heuristics.
+- Systems optimizations: parallel rollouts/episodes with multiprocessing; CPU thread caps for engine stability.

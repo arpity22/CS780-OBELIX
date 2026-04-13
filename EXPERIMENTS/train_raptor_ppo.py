@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import signal
 import multiprocessing as mp
 from collections import deque
 from dataclasses import dataclass
@@ -15,8 +16,33 @@ from torch.distributions import Categorical
 ACTIONS: List[str] = ["L45", "L22", "FW", "R22", "R45"]
 
 
+def load_obelix_class(obelix_py: str):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("obelix_eval_env", obelix_py)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.OBELIX
+
+
+def is_success_transition(env, reward: float, done: bool) -> bool:
+    if not done:
+        return False
+    if bool(getattr(env, "enable_push", False)):
+        try:
+            if bool(env._box_touches_boundary(env.box_center_x, env.box_center_y)):
+                return True
+        except Exception:
+            pass
+    # Compatibility fallback if internals are unavailable.
+    return reward >= 1900.0
+
+
 def env_worker(remote, obelix_py: str, args, seed: int):
     import importlib.util
+
+    # Keep Ctrl+C handling in the main process to avoid noisy worker tracebacks.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     spec = importlib.util.spec_from_file_location("obelix_env", obelix_py)
     mod = importlib.util.module_from_spec(spec)
@@ -32,14 +58,16 @@ def env_worker(remote, obelix_py: str, args, seed: int):
         seed=seed,
     )
 
-    success_bonus = 2000
-
     while True:
         try:
             cmd, data = remote.recv()
             if cmd == "step":
-                s, r, d = env.step(data, render=False)
-                is_success = r >= success_bonus
+                if isinstance(data, tuple):
+                    action, render_flag = data
+                else:
+                    action, render_flag = data, False
+                s, r, d = env.step(action, render=bool(render_flag))
+                is_success = bool(is_success_transition(env, float(r), bool(d)))
                 if d:
                     s = env.reset()
                 remote.send((s, r, d, is_success))
@@ -49,6 +77,8 @@ def env_worker(remote, obelix_py: str, args, seed: int):
                 remote.close()
                 break
         except EOFError:
+            break
+        except KeyboardInterrupt:
             break
 
 
@@ -233,6 +263,231 @@ def compute_gae(
     return advantages, returns
 
 
+def linear_decay(start: float, end: float, progress: float, decay_frac: float) -> float:
+    if decay_frac <= 0:
+        return end
+    mix = min(1.0, max(0.0, progress / decay_frac))
+    return start + (end - start) * mix
+
+
+def _aligned_eval_action(
+    logits: np.ndarray,
+    obs: np.ndarray,
+    steps_since_seen: int,
+    search_turn_dir: int,
+    stuck_recovery_count: int,
+) -> Tuple[int, int, int]:
+    # Deterministic inference-aligned policy used by evaluation and submission agent.
+    stuck = bool(obs[17] > 0.5)
+    if stuck:
+        stuck_recovery_count += 1
+        phase = stuck_recovery_count % 4
+        if phase == 2:
+            search_turn_dir *= -1
+        if phase in (1, 2):
+            return (0 if search_turn_dir > 0 else 4), search_turn_dir, stuck_recovery_count
+        return 2, search_turn_dir, stuck_recovery_count
+
+    stuck_recovery_count = 0
+
+    sees_target = bool(np.any(obs[:17] > 0))
+    front_active = bool(np.any(obs[4:12] > 0))
+
+    if not sees_target:
+        if steps_since_seen > 35:
+            # Deterministic structured search.
+            if (steps_since_seen % 7) == 0:
+                search_turn_dir *= -1
+            if (steps_since_seen % 5) in (0, 1):
+                return (1 if search_turn_dir > 0 else 3), search_turn_dir, stuck_recovery_count
+            return 2, search_turn_dir, stuck_recovery_count
+
+        if front_active:
+            return 2, search_turn_dir, stuck_recovery_count
+        return int(np.argmax(logits)), search_turn_dir, stuck_recovery_count
+
+    if front_active:
+        return 2, search_turn_dir, stuck_recovery_count
+
+    return int(np.argmax(logits)), search_turn_dir, stuck_recovery_count
+
+
+@torch.no_grad()
+def run_deterministic_eval(
+    actor_critic: RecurrentActorCritic,
+    args,
+    device: torch.device,
+    rollout_id: int,
+) -> Tuple[float, float, float]:
+    obelix_cls = load_obelix_class(args.obelix_py)
+    env = obelix_cls(
+        scaling_factor=args.scaling_factor,
+        arena_size=args.arena_size,
+        max_steps=args.max_steps,
+        wall_obstacles=args.wall_obstacles,
+        difficulty=args.difficulty,
+        box_speed=args.box_speed,
+        seed=args.seed + 90000 + rollout_id,
+    )
+
+    actor_critic.eval()
+
+    ep_rewards = []
+    ep_lengths = []
+    ep_success = []
+
+    for ep in range(args.eval_episodes):
+        obs = np.asarray(env.reset(seed=args.seed + rollout_id * 409 + ep), dtype=np.float32)
+
+        hidden = actor_critic.initial_hidden(1, device)
+        prev_obs = obs.copy()
+        last_action = np.array([2], dtype=np.int64)
+        steps_since_seen = np.array([0], dtype=np.int64)
+        ep_step_vec = np.array([0], dtype=np.int64)
+
+        total_reward = 0.0
+        success = 0.0
+
+        for _ in range(args.max_steps):
+            if np.any(obs[:17] > 0):
+                steps_since_seen[0] = 0
+            else:
+                steps_since_seen[0] += 1
+
+            aug_obs = augment_obs(
+                obs.reshape(1, -1),
+                prev_obs.reshape(1, -1),
+                last_action,
+                steps_since_seen,
+                ep_step_vec,
+                args.max_steps,
+            )[0]
+
+            obs_t = torch.tensor(aug_obs, dtype=torch.float32, device=device).view(1, -1)
+            logits, _, _, hidden = actor_critic.step(obs_t, hidden)
+            action_idx = int(torch.argmax(logits[0]).item())
+
+            s2, rew, done = env.step(ACTIONS[action_idx], render=False)
+            s2 = np.asarray(s2, dtype=np.float32)
+
+            total_reward += float(rew)
+            if is_success_transition(env, float(rew), bool(done)):
+                success = 1.0
+
+            ep_step_vec[0] += 1
+            last_action[0] = action_idx
+            prev_obs = obs.copy()
+            obs = s2
+
+            if done:
+                break
+
+        ep_rewards.append(total_reward)
+        ep_lengths.append(int(ep_step_vec[0]))
+        ep_success.append(success)
+
+    actor_critic.train()
+    return float(np.mean(ep_rewards)), float(np.mean(ep_lengths)), float(np.mean(ep_success) * 100.0)
+
+
+@torch.no_grad()
+def run_submission_style_eval(
+    actor_critic: RecurrentActorCritic,
+    args,
+    device: torch.device,
+    rollout_id: int,
+) -> Tuple[float, float, float, float]:
+    obelix_cls = load_obelix_class(args.obelix_py)
+    env = obelix_cls(
+        scaling_factor=args.scaling_factor,
+        arena_size=args.arena_size,
+        max_steps=args.max_steps,
+        wall_obstacles=args.wall_obstacles,
+        difficulty=args.difficulty,
+        box_speed=args.box_speed,
+        seed=args.seed + 120000 + rollout_id,
+    )
+
+    actor_critic.eval()
+
+    ep_rewards = []
+    ep_lengths = []
+    ep_success = []
+    ep_stuck_rates = []
+
+    for ep in range(args.eval_submission_episodes):
+        obs = np.asarray(env.reset(seed=args.seed + rollout_id * 521 + ep), dtype=np.float32)
+
+        hidden = actor_critic.initial_hidden(1, device)
+        prev_obs = obs.copy()
+        last_action = np.array([2], dtype=np.int64)
+        steps_since_seen = np.array([0], dtype=np.int64)
+        ep_step_vec = np.array([0], dtype=np.int64)
+
+        search_turn_dir = 1
+        stuck_recovery_count = 0
+
+        total_reward = 0.0
+        success = 0.0
+        stuck_steps = 0
+
+        for _ in range(args.max_steps):
+            if bool(obs[17] > 0.5):
+                stuck_steps += 1
+            if np.any(obs[:17] > 0):
+                steps_since_seen[0] = 0
+            else:
+                steps_since_seen[0] += 1
+
+            aug_obs = augment_obs(
+                obs.reshape(1, -1),
+                prev_obs.reshape(1, -1),
+                last_action,
+                steps_since_seen,
+                ep_step_vec,
+                args.max_steps,
+            )[0]
+
+            obs_t = torch.tensor(aug_obs, dtype=torch.float32, device=device).view(1, -1)
+            logits, _, _, hidden = actor_critic.step(obs_t, hidden)
+            logits_np = logits[0].detach().cpu().numpy().astype(np.float64)
+            action_idx, search_turn_dir, stuck_recovery_count = _aligned_eval_action(
+                logits=logits_np,
+                obs=obs,
+                steps_since_seen=int(steps_since_seen[0]),
+                search_turn_dir=search_turn_dir,
+                stuck_recovery_count=stuck_recovery_count,
+            )
+
+            s2, rew, done = env.step(ACTIONS[action_idx], render=False)
+            s2 = np.asarray(s2, dtype=np.float32)
+
+            total_reward += float(rew)
+            if is_success_transition(env, float(rew), bool(done)):
+                success = 1.0
+
+            ep_step_vec[0] += 1
+            last_action[0] = action_idx
+            prev_obs = obs.copy()
+            obs = s2
+
+            if done:
+                break
+
+        ep_rewards.append(total_reward)
+        ep_lengths.append(int(ep_step_vec[0]))
+        ep_success.append(success)
+        ep_stuck_rates.append(100.0 * stuck_steps / float(max(1, int(ep_step_vec[0]))))
+
+    actor_critic.train()
+    return (
+        float(np.mean(ep_rewards)),
+        float(np.mean(ep_lengths)),
+        float(np.mean(ep_success) * 100.0),
+        float(np.mean(ep_stuck_rates)),
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="RAPTOR-PPO: Recurrent Action-conditioned PPO + RND for OBELIX"
@@ -247,25 +502,44 @@ def parse_args():
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_envs", type=int, default=8)
-    parser.add_argument("--horizon", type=int, default=256)
-    parser.add_argument("--total_steps", type=int, default=5_000_000)
+    parser.add_argument("--horizon", type=int, default=512)
+    parser.add_argument("--total_steps", type=int, default=2_000_000)
 
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument("--clip_coef", type=float, default=0.2)
     parser.add_argument("--vf_coef", type=float, default=0.7)
-    parser.add_argument("--ent_coef", type=float, default=0.01)
+    parser.add_argument("--ent_coef", type=float, default=0.002)
     parser.add_argument("--max_grad_norm", type=float, default=0.8)
 
     parser.add_argument("--ppo_epochs", type=int, default=4)
     parser.add_argument("--envs_per_batch", type=int, default=4)
 
-    parser.add_argument("--intrinsic_coef", type=float, default=0.25)
-    parser.add_argument("--rnd_coef", type=float, default=0.5)
+    parser.add_argument("--intrinsic_coef", type=float, default=0.15)
+    parser.add_argument("--intrinsic_coef_final", type=float, default=0.0)
+    parser.add_argument("--intrinsic_decay_frac", type=float, default=0.25)
+    parser.add_argument("--rnd_coef", type=float, default=0.15)
     parser.add_argument("--dyn_coef", type=float, default=0.05)
+    parser.add_argument("--stuck_extra_penalty", type=float, default=2.0)
+    parser.add_argument("--fw_tracking_bonus", type=float, default=0.03)
 
-    parser.add_argument("--save_dir", type=str, default="submission_raptor_ppo")
+    parser.add_argument("--eval_every_rollouts", type=int, default=50)
+    parser.add_argument("--eval_episodes", type=int, default=16)
+    parser.add_argument("--eval_submission_episodes", type=int, default=16)
+    parser.add_argument(
+        "--render_train_env",
+        action="store_true",
+        help="Render a single vectorized environment during training.",
+    )
+    parser.add_argument(
+        "--render_env_index",
+        type=int,
+        default=0,
+        help="Environment index to render when --render_train_env is enabled.",
+    )
+
+    parser.add_argument("--save_dir", type=str, default="submission_raptor_ppo1")
     return parser.parse_args()
 
 
@@ -314,17 +588,31 @@ def train():
     reward_window = deque(maxlen=300)
     length_window = deque(maxlen=300)
     success_window = deque(maxlen=500)
+    best_score = -1e9
+    best_eval_success = -1e9
+    best_eval_reward = -1e18
+    os.makedirs(args.save_dir, exist_ok=True)
 
     global_step = 0
     rollout_id = 0
+    render_env_index = args.render_env_index % args.num_envs
 
     print(
         f"Training RAPTOR-PPO | envs={args.num_envs} horizon={args.horizon} total_steps={args.total_steps}"
     )
+    if args.render_train_env:
+        print(f"Rendering environment index {render_env_index} during training.")
 
     try:
         while global_step < args.total_steps:
             rollout_id += 1
+            progress = global_step / float(max(1, args.total_steps))
+            intrinsic_coef_now = linear_decay(
+                args.intrinsic_coef,
+                args.intrinsic_coef_final,
+                progress,
+                args.intrinsic_decay_frac,
+            )
 
             obs_buf = np.zeros((args.horizon, args.num_envs, obs_dim), dtype=np.float32)
             starts_buf = np.zeros((args.horizon, args.num_envs), dtype=np.float32)
@@ -372,8 +660,9 @@ def train():
                 values_buf[t] = values.cpu().numpy()
                 rewards_int_raw_buf[t] = intr_raw.cpu().numpy()
 
-                for r, a in zip(remotes, action_idx):
-                    r.send(("step", ACTIONS[int(a)]))
+                for env_i, (r, a) in enumerate(zip(remotes, action_idx)):
+                    render_flag = bool(args.render_train_env and env_i == render_env_index)
+                    r.send(("step", (ACTIONS[int(a)], render_flag)))
                 results = [r.recv() for r in remotes]
 
                 next_obs = np.zeros_like(obs)
@@ -384,6 +673,16 @@ def train():
                     next_obs[i] = s2
 
                     scaled_rew = float(np.clip(rew / 100.0, -5.0, 25.0))
+                    if bool(s2[17]):
+                        scaled_rew -= float(args.stuck_extra_penalty)
+                    if action_idx[i] == 2 and np.any(s2[4:12] > 0) and (not bool(s2[17])):
+                        scaled_rew += float(args.fw_tracking_bonus)
+                    # Mild anti-spin shaping when target is not currently visible.
+                    if (not bool(s2[17])) and (not np.any(s2[:17] > 0)):
+                        if action_idx[i] == 2:
+                            scaled_rew += 0.003
+                        else:
+                            scaled_rew -= 0.002
                     rewards_ext_buf[t, i] = scaled_rew
 
                     done_mask[i] = 1.0 if done else 0.0
@@ -438,7 +737,7 @@ def train():
             intr_scale = 1.0 / np.sqrt(rms_intrinsic.var + 1e-8)
             rewards_int = np.clip(rewards_int_raw_buf * intr_scale, 0.0, 5.0)
 
-            rewards_total = rewards_ext_buf + args.intrinsic_coef * rewards_int
+            rewards_total = rewards_ext_buf + intrinsic_coef_now * rewards_int
 
             advantages, returns = compute_gae(
                 rewards_total,
@@ -517,24 +816,92 @@ def train():
                 sr = float(np.mean(success_window) * 100.0) if success_window else 0.0
                 avg_ext = float(np.mean(rewards_ext_buf))
                 avg_int = float(np.mean(rewards_int))
+                score = sr + 0.05 * avg_rew
+
+                if score > best_score:
+                    best_score = score
+                    best_path = os.path.join(args.save_dir, "weights_best.pth")
+                    torch.save(
+                        {
+                            "model_state_dict": actor_critic.state_dict(),
+                            "obs_dim": obs_dim,
+                            "hidden_dim": actor_critic.hidden_dim,
+                            "algorithm": "RAPTOR-PPO-RND",
+                            "score": best_score,
+                        },
+                        best_path,
+                    )
+
                 print(
                     f"Step {global_step}/{args.total_steps} | AvgEpRew {avg_rew:.1f} | "
-                    f"AvgEpLen {avg_len:.1f} | Success {sr:.1f}% | Ext {avg_ext:.3f} | Int {avg_int:.3f}"
+                    f"AvgEpLen {avg_len:.1f} | Success {sr:.1f}% | Ext {avg_ext:.3f} | "
+                    f"Int {avg_int:.3f} | IntrCoef {intrinsic_coef_now:.3f}"
                 )
 
+            if args.eval_every_rollouts > 0 and (rollout_id % args.eval_every_rollouts == 0):
+                eval_rew, eval_len, eval_sr, eval_stuck = run_submission_style_eval(
+                    actor_critic=actor_critic,
+                    args=args,
+                    device=device,
+                    rollout_id=rollout_id,
+                )
+
+                # Use a single objective to reduce train-submit mismatch: maximize eval reward.
+                better_eval_policy = (eval_rew > best_eval_reward) or (
+                    abs(eval_rew - best_eval_reward) <= 1e-9 and eval_sr > best_eval_success
+                )
+                if better_eval_policy:
+                    best_eval_success = eval_sr
+                    best_eval_reward = eval_rew
+                    eval_path = os.path.join(args.save_dir, "weights_eval_best.pth")
+                    torch.save(
+                        {
+                            "model_state_dict": actor_critic.state_dict(),
+                            "obs_dim": obs_dim,
+                            "hidden_dim": actor_critic.hidden_dim,
+                            "algorithm": "RAPTOR-PPO-RND",
+                            "eval_success_rate": best_eval_success,
+                            "eval_mean_reward": best_eval_reward,
+                            "eval_stuck_rate": eval_stuck,
+                        },
+                        eval_path,
+                    )
+                print(
+                    f"[Eval] Rollout {rollout_id} | MeanRew {eval_rew:.1f} | "
+                    f"MeanLen {eval_len:.1f} | Success {eval_sr:.1f}% | Stuck {eval_stuck:.1f}%"
+                )
+
+    except KeyboardInterrupt:
+        print("Training interrupted by user. Saving checkpoints and shutting down cleanly...")
+
     finally:
-        os.makedirs(args.save_dir, exist_ok=True)
         weights_path = os.path.join(args.save_dir, "weights.pth")
-        torch.save(
-            {
-                "model_state_dict": actor_critic.state_dict(),
-                "obs_dim": obs_dim,
-                "hidden_dim": actor_critic.hidden_dim,
-                "algorithm": "RAPTOR-PPO-RND",
-            },
-            weights_path,
-        )
-        print(f"Saved model weights to {weights_path}")
+        eval_path = os.path.join(args.save_dir, "weights_eval_best.pth")
+        sub_eval_path = os.path.join(args.save_dir, "weights_submission_best.pth")
+        best_path = os.path.join(args.save_dir, "weights_best.pth")
+        if os.path.exists(eval_path):
+            eval_payload = torch.load(eval_path, map_location="cpu")
+            torch.save(eval_payload, weights_path)
+            print(f"Saved eval-best model weights to {weights_path}")
+        elif os.path.exists(sub_eval_path):
+            sub_eval_payload = torch.load(sub_eval_path, map_location="cpu")
+            torch.save(sub_eval_payload, weights_path)
+            print(f"Saved submission-eval-best model weights to {weights_path}")
+        elif os.path.exists(best_path):
+            best_payload = torch.load(best_path, map_location="cpu")
+            torch.save(best_payload, weights_path)
+            print(f"Saved best model weights to {weights_path}")
+        else:
+            torch.save(
+                {
+                    "model_state_dict": actor_critic.state_dict(),
+                    "obs_dim": obs_dim,
+                    "hidden_dim": actor_critic.hidden_dim,
+                    "algorithm": "RAPTOR-PPO-RND",
+                },
+                weights_path,
+            )
+            print(f"Saved model weights to {weights_path}")
 
         for r in remotes:
             try:

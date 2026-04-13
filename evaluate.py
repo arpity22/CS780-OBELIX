@@ -72,7 +72,7 @@ def evaluate_agent(
         done = False
         while not done:
             action = agent_policy(obs, rng)
-            obs, reward, done = env.step(action, render=False)
+            obs, reward, done = env.step(action, render=True)
             total += float(reward)
 
         scores.append(total)
@@ -146,7 +146,7 @@ def main() -> None:
     parser.add_argument(
         "--difficulty",
         type=int,
-        default=0,
+        default=3,
         help="difficulty level: 0=static, 2=blinking box, 3=moving+blinking",
     )
     parser.add_argument(

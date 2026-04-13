@@ -46,7 +46,9 @@ _last_action_idx = 2
 _prev_obs: Optional[np.ndarray] = None
 _steps_since_seen = 0
 _ep_step = 0
-_MAX_EP_STEPS_BEFORE_RESET = 1200
+_MAX_EP_STEPS_BEFORE_RESET = 700
+_search_turn_dir = 1
+_stuck_recovery_count = 0
 
 
 def _augment_obs(obs: np.ndarray) -> np.ndarray:
@@ -70,6 +72,92 @@ def _augment_obs(obs: np.ndarray) -> np.ndarray:
 
     aug = np.concatenate([obs, delta, one_hot, [seen_feat, progress_feat]])
     return aug.astype(np.float32)
+
+
+def _soft_reset(obs: np.ndarray) -> None:
+    global _hidden, _last_action_idx, _prev_obs, _steps_since_seen, _ep_step, _stuck_recovery_count
+    _hidden = _model.initial_hidden(1, torch.device("cpu"))
+    _last_action_idx = 2
+    _prev_obs = obs.copy()
+    _steps_since_seen = 0
+    _ep_step = 0
+    _stuck_recovery_count = 0
+
+
+def _likely_episode_reset(obs: np.ndarray) -> bool:
+    if _prev_obs is None:
+        return True
+    if _ep_step < 12:
+        return False
+    # New episodes usually produce large observation jumps from random respawn.
+    jump = float(np.sum(np.abs(obs - _prev_obs)))
+    return jump >= 7.0
+
+
+def _heuristic_recovery_action(obs: np.ndarray) -> Optional[int]:
+    global _search_turn_dir, _stuck_recovery_count
+
+    stuck = bool(obs[17] > 0.5)
+    if stuck:
+        _stuck_recovery_count += 1
+        if _stuck_recovery_count % 2 == 0:
+            _search_turn_dir *= -1
+        return 0 if _search_turn_dir > 0 else 4
+
+    _stuck_recovery_count = 0
+
+    # Long no-detection intervals are handled by active scanning instead of drifting forward.
+    if _steps_since_seen > 35:
+        if (_ep_step % 6) == 0:
+            _search_turn_dir *= -1
+        return 1 if _search_turn_dir > 0 else 3
+
+    # If front sensors are active, pushing forward is usually the most stable choice.
+    if np.any(obs[4:12] > 0):
+        return 2
+
+    return None
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    z = x - np.max(x)
+    ez = np.exp(z)
+    return ez / np.sum(ez)
+
+
+def _sample_action_from_policy(logits: torch.Tensor, obs: np.ndarray, rng: np.random.Generator) -> int:
+    # Split behavior into search vs tracking phases for better POMDP robustness.
+    attached = bool(obs[17] > 0.5)
+    sees_target = bool(np.any(obs[:17] > 0))
+    front_active = bool(np.any(obs[4:12] > 0))
+
+    logit_np = logits.detach().cpu().numpy().astype(np.float64)
+
+    if attached:
+        return 2
+
+    if not sees_target:
+        # Search phase: controlled stochastic exploration with turn bias.
+        explore_p = min(0.45, 0.12 + 0.012 * float(min(_steps_since_seen, 20)))
+        if float(rng.random()) < explore_p:
+            if float(rng.random()) < 0.75:
+                return int(rng.choice([0, 1, 3, 4]))
+            return 2
+        return int(np.argmax(logit_np))
+
+    # Tracking phase: if uncertain, sample with low temperature to avoid brittle determinism.
+    order = np.argsort(-logit_np)
+    margin = float(logit_np[order[0]] - logit_np[order[1]])
+
+    if front_active and margin >= 0.05:
+        return 2
+
+    if margin < 0.12:
+        temp = 0.7 if front_active else 0.9
+        probs = _softmax(logit_np / temp)
+        return int(rng.choice(len(ACTIONS), p=probs))
+
+    return int(np.argmax(logit_np))
 
 
 def _load_once() -> None:
@@ -114,17 +202,18 @@ def policy(obs: np.ndarray, rng: np.random.Generator) -> str:
 
     _load_once()
 
-    if _ep_step == 0:
-        _hidden = _model.initial_hidden(1, torch.device("cpu"))
-        _last_action_idx = 2
-        _prev_obs = obs.copy()
-        _steps_since_seen = 0
+    if _ep_step == 0 or _likely_episode_reset(obs):
+        _soft_reset(obs)
 
     aug_obs = _augment_obs(obs)
     obs_t = torch.from_numpy(aug_obs).float().view(1, -1)
 
     logits, _, _, _hidden = _model.step(obs_t, _hidden)
-    action_idx = int(torch.argmax(logits[0]).item())
+    action_idx = _sample_action_from_policy(logits[0], obs, rng)
+
+    override_action = _heuristic_recovery_action(obs)
+    if override_action is not None:
+        action_idx = override_action
 
     _last_action_idx = action_idx
     _prev_obs = obs.copy()

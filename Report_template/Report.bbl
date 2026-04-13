@@ -1,0 +1,43 @@
+\begin{thebibliography}{1}
+
+\bibitem{mahadevan1991automatic}
+S.~Mahadevan and J.~H. Connell, ``Automatic programming of behaviour-based
+  robots using reinforcement learning,'' in {\em Proceedings of the Ninth
+  National Conference on Artificial Intelligence (AAAI-91)}, 1991.
+
+\bibitem{vanhasselt2016double}
+H.~van Hasselt, A.~Guez, and D.~Silver, ``Deep reinforcement learning with
+  double {Q}-learning,'' in {\em Proceedings of the Thirtieth {AAAI} Conference
+  on Artificial Intelligence}, 2016.
+
+\bibitem{wang2016dueling}
+Z.~Wang, T.~Schaul, M.~Hessel, H.~van Hasselt, M.~Lanctot, and N.~de~Freitas,
+  ``Dueling network architectures for deep reinforcement learning,'' in {\em
+  International Conference on Machine Learning (ICML)}, 2016.
+
+\bibitem{schaul2016per}
+T.~Schaul, J.~Quan, I.~Antonoglou, and D.~Silver, ``Prioritized experience
+  replay,'' in {\em International Conference on Learning Representations
+  (ICLR)}, 2016.
+
+\bibitem{schulman2017ppo}
+J.~Schulman, F.~Wolski, P.~Dhariwal, A.~Radford, and O.~Klimov, ``Proximal
+  policy optimization algorithms,'' {\em arXiv preprint arXiv:1707.06347},
+  2017.
+
+\bibitem{schulman2016gae}
+J.~Schulman, P.~Moritz, S.~Levine, M.~Jordan, and P.~Abbeel, ``High-dimensional
+  continuous control using generalized advantage estimation,'' {\em arXiv
+  preprint arXiv:1506.02438}, 2016.
+
+\bibitem{burda2019rnd}
+Y.~Burda, H.~Edwards, A.~Storkey, and O.~Klimov, ``Exploration by random
+  network distillation,'' in {\em International Conference on Learning
+  Representations (ICLR)}, 2019.
+
+\bibitem{hafner2020dreamer}
+D.~Hafner, T.~Lillicrap, M.~Norouzi, and J.~Ba, ``Dream to control: Learning
+  behaviors by latent imagination,'' in {\em International Conference on
+  Learning Representations (ICLR)}, 2020.
+
+\end{thebibliography}
